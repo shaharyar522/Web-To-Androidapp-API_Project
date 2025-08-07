@@ -1,0 +1,28 @@
+Array
+(
+    [data] => Array
+        (
+            [title] => New Deal
+            [descriptions] => This is a deal description.
+            [notes] => Some internal notes.
+            [press_release_link] => https://example.com/release
+            [tags] => merger,tech
+            [photos] => photo.jpg
+            [amount] => 1000000
+            [owner] => John Doe
+            [firm] => Doe Law Firm
+            [posted_date] => 2025-08-07
+            [other_attorneys] => Jane Roe
+            [client] => Tech Client
+            [industry] => Technology
+            [company_name] => Tech Corp
+            [state] => CA
+            [city] => San Francisco
+            [practice_area] => M&A
+            [speciality] => Corporate
+            [status] => Published
+        )
+
+    [affected_rows] => 1
+    [stmt_error] => 
+)
