@@ -8,18 +8,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' && $_SERVER['REQUEST_METHOD'] !== 'PUT
 }
 
 // ===== Database Connection =====
-$host = "localhost";
-$db_name = "esqify_db";
-$username = "root";
-$password = "";
+require_once 'conn.php';
 
-try {
-    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password);
-    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch (PDOException $e) {
-    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
-    exit();
-}
 
 // ===== Get JSON Data =====
 $data = json_decode(file_get_contents('php://input'), true);
