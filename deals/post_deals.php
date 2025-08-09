@@ -1,41 +1,75 @@
 <?php
+header("Content-Type: application/json");
 
-namespace App\Http\Controllers\Api;
+// ===== Only Allow POST =====
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    echo json_encode(["status" => false, "message" => "Only POST method is allowed"]);
+    exit();
+}
 
-use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
-use App\Models\Deal;
+// ===== Database Connection =====
+$host = "localhost";
+$db_name = "esqify_db";
+$username = "root";
+$password = "";
 
-class UserDealApiController extends Controller
-{
-    public function store(Request $request)
-    {
-        // Validate input
-        $request->validate([
-            'title'       => 'required|string|max:255',
-            'description' => 'nullable|string',
-            'owner'       => 'required|exists:users,id',
-        ]);
+try {
+    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password);
+    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
+    exit();
+}
 
-        try {
-            // Create deal
-            $deal = Deal::create([
-                'title'        => $request->input('title'),
-                'descriptions' => $request->input('description'),
-                'user_id'      => $request->input('owner'),
-            ]);
+// ===== Read & Validate Input =====
+$data = json_decode(file_get_contents("php://input"), true);
 
-            return response()->json([
-                'status'  => true,
-                'message' => 'Deal created successfully.',
-                'data'    => $deal,
-            ], 201);
+// Required fields
+$required_fields = ["title", "owner", "state", "industry", "practice_area", "speciality"];
+$missing_fields = [];
 
-        } catch (\Exception $e) {
-            return response()->json([
-                'status'  => false,
-                'message' => 'Failed to create deal: ' . $e->getMessage(),
-            ], 500);
-        }
+foreach ($required_fields as $field) {
+    if (!isset($data[$field]) || trim($data[$field]) === "") {
+        $missing_fields[] = $field;
     }
 }
+
+if (!empty($missing_fields)) {
+    echo json_encode([
+        "status" => false,
+        "message" => "Missing required fields: " . implode(", ", $missing_fields)
+    ]);
+    exit();
+}
+
+// ===== Prepare Insert Query =====
+$sql = "INSERT INTO deals 
+(title, owner, state, industry, practice_area, speciality, descriptions, created_at) 
+VALUES 
+(:title, :owner, :state, :industry, :practice_area, :speciality, :descriptions, NOW())";
+
+try {
+    $stmt = $conn->prepare($sql);
+    $stmt->bindValue(":title", trim($data["title"]), PDO::PARAM_STR);
+    $stmt->bindValue(":owner", intval($data["owner"]), PDO::PARAM_INT);
+    $stmt->bindValue(":state", intval($data["state"]), PDO::PARAM_INT);
+    $stmt->bindValue(":industry", intval($data["industry"]), PDO::PARAM_INT);
+    $stmt->bindValue(":practice_area", intval($data["practice_area"]), PDO::PARAM_INT);
+    $stmt->bindValue(":speciality", intval($data["speciality"]), PDO::PARAM_INT);
+    $stmt->bindValue(":descriptions", isset($data["description"]) ? trim($data["descriptions"]) : null, PDO::PARAM_STR);
+
+    $stmt->execute();
+
+    echo json_encode([
+        "status" => true,
+        "message" => "Deal posted successfully",
+        "deal_id" => $conn->lastInsertId()
+    ]);
+
+} catch (PDOException $e) {
+    echo json_encode([
+        "status" => false,
+        "message" => "Error posting deal: " . $e->getMessage()
+    ]);
+}
+?>

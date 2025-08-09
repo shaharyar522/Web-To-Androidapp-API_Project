@@ -1,109 +1,105 @@
 <?php
+header("Content-Type: application/json");
 
-namespace App\Http\Controllers\Api;
+// ===== Only Allow POST or PUT =====
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' && $_SERVER['REQUEST_METHOD'] !== 'PUT') {
+    echo json_encode(["status" => false, "message" => "Only POST or PUT method is allowed"]);
+    exit();
+}
 
-use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
-use App\Models\Deal;
-use Illuminate\Support\Facades\Auth;
+// ===== Database Connection =====
+$host = "localhost";
+$db_name = "esqify_db";
+$username = "root";
+$password = "";
 
-class UserDealApiController extends Controller
-{
-    // ✅ View Deals
-    public function index(Request $request)
-    {
-        $query = Deal::with('ownerInfo')->whereNull('deleted_at');
+try {
+    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password);
+    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
+    exit();
+}
 
-        // Optional: filter by logged-in user
-        if ($request->has('user_only') && $request->user_only == 1 && Auth::check()) {
-            $query->where('user_id', Auth::id());
-        }
+// ===== Get JSON Data =====
+$data = json_decode(file_get_contents('php://input'), true);
 
-        // Sorting
-        if ($request->filled('sort')) {
-            $sortOptions = [
-                'latest' => ['id', 'desc'],
-                'oldest' => ['id', 'asc'],
-                'a_to_z' => ['title', 'asc'],
-                'z_to_a' => ['title', 'desc'],
-            ];
-            if (isset($sortOptions[$request->sort])) {
-                $query->orderBy(...$sortOptions[$request->sort]);
-            }
-        } else {
-            $query->orderBy('id', 'desc');
-        }
+if (!$data) {
+    echo json_encode(["status" => false, "message" => "Invalid JSON input"]);
+    exit();
+}
 
-        // Pagination
-        $perPage = $request->get('per_page', 10);
-        $deals = $query->paginate($perPage);
+// ===== Required: Deal ID =====
+$deal_id = isset($data['id']) ? intval($data['id']) : null;
+if (!$deal_id) {
+    echo json_encode(["status" => false, "message" => "Deal ID is required"]);
+    exit();
+}
 
-        return response()->json($deals);
+// ===== Allowed fields for update =====
+$allowedFields = [
+    'title',
+    'descriptions',
+    'notes',
+    'press_release_link',
+    'tags',
+    'photos',
+    'amount',
+    'owner',
+    'firm',
+    'posted_date',
+    'status',
+    'client',
+    'industry',
+    'company_name',
+    'state',
+    'city',
+    'practice_area',
+    'speciality',
+    'other_attorneys'
+];
+
+// ===== Build SET part dynamically =====
+$setParts = [];
+$params = [];
+
+foreach ($allowedFields as $field) {
+    if (array_key_exists($field, $data)) { // allow null values too
+        $setParts[] = "$field = ?";
+        $params[] = $data[$field];
+    }
+}
+
+if (empty($setParts)) {
+    echo json_encode(["status" => false, "message" => "No valid fields to update"]);
+    exit();
+}
+
+$setSql = implode(", ", $setParts);
+
+// ===== Check if deal exists =====
+try {
+    $checkSql = "SELECT COUNT(*) FROM deals WHERE id = ?";
+    $checkStmt = $conn->prepare($checkSql);
+    $checkStmt->execute([$deal_id]);
+
+    if ($checkStmt->fetchColumn() == 0) {
+        echo json_encode(["status" => false, "message" => "Deal not found"]);
+        exit();
     }
 
-    // ✅ Post a Deal
-    public function store(Request $request)
-    {
-        $request->validate([
-            'title'       => 'required|string|max:255',
-            'description' => 'nullable|string',
-            'owner'       => 'required|exists:users,id',
-        ]);
+    // ===== Update Deal =====
+    $params[] = $deal_id;
+    $sql = "UPDATE deals SET $setSql, updated_at = NOW() WHERE id = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($params);
 
-        try {
-            $deal = Deal::create([
-                'title'        => $request->input('title'),
-                'descriptions' => $request->input('description'),
-                'user_id'      => $request->input('owner'),
-            ]);
-
-            return response()->json([
-                'status'  => true,
-                'message' => 'Deal created successfully.',
-                'data'    => $deal
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'status'  => false,
-                'message' => 'Failed to create deal: ' . $e->getMessage()
-            ], 500);
-        }
+    if ($stmt->rowCount() > 0) {
+        echo json_encode(["status" => true, "message" => "Deal updated successfully"]);
+    } else {
+        echo json_encode(["status" => true, "message" => "No changes made"]);
     }
 
-    // ✅ Edit/Update Deal
-    public function update(Request $request, $id)
-    {
-        $request->validate([
-            'title'       => 'required|string|max:255',
-            'description' => 'nullable|string',
-            'owner'       => 'required|exists:users,id',
-        ]);
-
-        $deal = Deal::find($id);
-
-        if (!$deal) {
-            return response()->json([
-                'status'  => false,
-                'message' => 'Deal not found.'
-            ], 404);
-        }
-
-        try {
-            $deal->title        = $request->input('title', $deal->title);
-            $deal->descriptions = $request->input('description', $deal->descriptions);
-            $deal->user_id      = $request->input('owner', $deal->user_id);
-            $deal->save();
-
-            return response()->json([
-                'status'  => true,
-                'message' => 'Deal updated successfully.',
-                'data'    => $deal
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'status'  => false,
-                'message' => 'Failed to update deal: ' . $e->getMessage()
-            ], 500);
-        }
-    }
+} catch (PDOException $e) {
+    echo json_encode(["status" => false, "message" => "Error updating deal: " . $e->getMessage()]);
 }
