@@ -10,6 +10,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 // ===== Database Connection =====
 require_once 'conn.php';
+require_once 'config.php';
 
 // ===== Read & Validate Input =====
 $data = json_decode(file_get_contents("php://input"), true);

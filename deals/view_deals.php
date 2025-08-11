@@ -4,6 +4,7 @@ header("Content-Type: application/json");
 
 // ===== Database Connection =====
 require_once 'conn.php';
+require_once 'config.php';
 
 
 // ===== Request Parameters =====

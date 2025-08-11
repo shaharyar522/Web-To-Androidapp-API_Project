@@ -8,6 +8,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 }
 
 require_once 'conn.php';
+require_once 'config.php';
 
 // ===== Get deal ID from query param =====
 $deal_id = isset($_GET['id']) ? intval($_GET['id']) : null;

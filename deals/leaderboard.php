@@ -1,126 +1,124 @@
 <?php
-header("Content-Type: application/json");
+header('Content-Type: application/json');
 
-// ===== Allow GET Only =====
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    echo json_encode(["status" => false, "message" => "Only GET method is allowed"]);
-    exit();
-}
-
-// ===== Database Connection =====
-$host = "localhost";
-$db_name = "esqify_db";
-$username = "root";
-$password = "";
-
-try {
-    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password);
-    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch (PDOException $e) {
-    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
-    exit();
-}
-
-// ===== Filters =====
-$title = isset($_GET['title']) ? trim($_GET['title']) : null;
-$state = isset($_GET['state_for_search']) ? trim($_GET['state_for_search']) : null;
-$industries = isset($_GET['industries_for_search']) ? (array) $_GET['industries_for_search'] : [];
-$practice_areas = isset($_GET['practice_areas_for_search']) ? (array) $_GET['practice_areas_for_search'] : [];
-$specialities = isset($_GET['specialities_areas_for_search']) ? (array) $_GET['specialities_areas_for_search'] : [];
-$sort_data = isset($_GET['sort_data']) ? trim($_GET['sort_data']) : null;
+require_once 'conn.php';
+require_once 'config.php'; // $conn from PDO connection
 
 // ===== Pagination =====
-$page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
-$per_page = isset($_GET['per_page']) ? max(1, intval($_GET['per_page'])) : 10;
-$offset = ($page - 1) * $per_page;
+$page     = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+$per_page = isset($_GET['par_page']) ? (int)$_GET['par_page'] : 10; // match Laravel's "par_page"
+$offset   = ($page - 1) * $per_page;
 
-// ===== Base Query =====
-$sql = "SELECT u.id, u.first_name, u.last_name, u.law_firm, u.state_province,
-               COUNT(d.id) AS deal_volume, 
-               COALESCE(SUM(d.amount), 0) AS deal_total
-        FROM users u
-        INNER JOIN deals d ON d.user_id = u.id
-        WHERE u.role_id = 3 
-          AND u.deleted_at IS NULL
-          AND d.deleted_at IS NULL";
+$where   = [];
+$params  = [];
 
-// ===== Dynamic Filters =====
-$params = [];
-
-if (!empty($title)) {
-    $sql .= " AND (CONCAT(u.first_name, ' ', u.last_name) LIKE ? OR u.law_firm LIKE ?)";
-    $params[] = "%$title%";
-    $params[] = "%$title%";
+// ===== Search by name/title =====
+if (!empty($_GET['title'])) {
+    $where[]  = "(CONCAT(u.first_name, ' ', u.last_name) LIKE ? OR u.law_firm LIKE ?)";
+    $params[] = '%' . $_GET['title'] . '%';
+    $params[] = '%' . $_GET['title'] . '%';
 }
 
-if (!empty($state)) {
-    $sql .= " AND u.state_province = ?";
-    $params[] = $state;
+// ===== State filter =====
+if (!empty($_GET['state_for_search'])) {
+    $where[]  = "u.state_province = ?";
+    $params[] = $_GET['state_for_search'];
 }
 
-if (!empty($industries)) {
-    $placeholders = implode(',', array_fill(0, count($industries), '?'));
-    $sql .= " AND u.industry IN ($placeholders)";
-    $params = array_merge($params, $industries);
+// ===== Industry filter =====
+if (!empty($_GET['industries_for_search'])) {
+    $industries    = explode(',', $_GET['industries_for_search']);
+    $placeholders  = implode(',', array_fill(0, count($industries), '?'));
+    $where[]       = "d.industry IN ($placeholders)";
+    $params        = array_merge($params, $industries);
 }
 
-if (!empty($practice_areas)) {
-    foreach ($practice_areas as $area) {
-        $sql .= " AND JSON_CONTAINS(u.practice_area, ?)";
-        $params[] = json_encode($area);
+// ===== Practice Area filter =====
+if (!empty($_GET['practice_areas_for_search'])) {
+    $practiceAreas = explode(',', $_GET['practice_areas_for_search']);
+    foreach ($practiceAreas as $area) {
+        $where[]  = "d.practice_area LIKE ?";
+        $params[] = '%' . $area . '%';
     }
 }
 
-if (!empty($specialities)) {
-    foreach ($specialities as $area) {
-        $sql .= " AND JSON_CONTAINS(u.speciality, ?)";
-        $params[] = json_encode($area);
+// ===== Speciality filter =====
+if (!empty($_GET['specialities_areas_for_search'])) {
+    $specialities = explode(',', $_GET['specialities_areas_for_search']);
+    foreach ($specialities as $spec) {
+        $where[]  = "d.speciality LIKE ?";
+        $params[] = '%' . $spec . '%';
     }
 }
 
-$sql .= " GROUP BY u.id";
+$whereSQL = $where ? ' AND ' . implode(' AND ', $where) : '';
 
 // ===== Sorting =====
-if ($sort_data === 'deal_volume') {
-    $sql .= " ORDER BY deal_volume DESC";
-} elseif ($sort_data === 'deal_total') {
-    $sql .= " ORDER BY deal_total DESC";
-} elseif ($sort_data === 'latest') {
-    $sql .= " ORDER BY u.id DESC";
-} elseif ($sort_data === 'oldest') {
-    $sql .= " ORDER BY u.id ASC";
-} elseif ($sort_data === 'ascending') {
-    $sql .= " ORDER BY u.first_name ASC";
-} elseif ($sort_data === 'descending') {
-    $sql .= " ORDER BY u.first_name DESC";
-} else {
-    $sql .= " ORDER BY u.id DESC";
+$orderBy = "ORDER BY u.id DESC"; // default: latest
+if (!empty($_GET['sort_data'])) {
+    switch ($_GET['sort_data']) {
+        case 'deal_volume':
+            $orderBy = "ORDER BY deal_count DESC";
+            break;
+        case 'deal_total':
+            $orderBy = "ORDER BY deal_sum DESC";
+            break;
+        case 'latest':
+            $orderBy = "ORDER BY u.id DESC";
+            break;
+        case 'oldest':
+            $orderBy = "ORDER BY u.id ASC";
+            break;
+        case 'ascending':
+            $orderBy = "ORDER BY u.first_name ASC";
+            break;
+        case 'descending':
+            $orderBy = "ORDER BY u.first_name DESC";
+            break;
+    }
 }
 
-// ===== Pagination Limit =====
-$sql .= " LIMIT $per_page OFFSET $offset";
+// ===== Main Query =====
+$sql = "
+    SELECT 
+        u.id, 
+        u.first_name, 
+        u.last_name, 
+        u.law_firm,
+        COUNT(d.id) AS deal_count,
+        COALESCE(SUM(d.amount), 0) AS deal_sum
+    FROM users u
+    JOIN deals d ON d.owner = u.id
+    WHERE u.role_id = 3 
+      AND u.deleted_at IS NULL
+      $whereSQL
+    GROUP BY u.id
+    $orderBy
+    LIMIT $per_page OFFSET $offset
+";
 
-// ===== Execute Query =====
 $stmt = $conn->prepare($sql);
 $stmt->execute($params);
-$data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$leaderboard = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// ===== Get Total Records =====
-$count_sql = "SELECT COUNT(DISTINCT u.id) 
-              FROM users u
-              INNER JOIN deals d ON d.user_id = u.id
-              WHERE u.role_id = 3 AND u.deleted_at IS NULL AND d.deleted_at IS NULL";
-$count_stmt = $conn->prepare($count_sql);
-$count_stmt->execute();
-$total = $count_stmt->fetchColumn();
+// ===== Total Count =====
+$sqlCount = "
+    SELECT COUNT(DISTINCT u.id) AS total
+    FROM users u
+    JOIN deals d ON d.owner = u.id
+    WHERE u.role_id = 3 
+      AND u.deleted_at IS NULL
+      $whereSQL
+";
+$stmtCount = $conn->prepare($sqlCount);
+$stmtCount->execute($params);
+$total = (int) $stmtCount->fetch(PDO::FETCH_ASSOC)['total'];
 
-// ===== Output =====
+// ===== Response =====
 echo json_encode([
-    "status" => true,
-    "message" => "Leaderboard fetched successfully",
-    "total" => intval($total),
-    "per_page" => $per_page,
-    "current_page" => $page,
-    "last_page" => ceil($total / $per_page),
-    "data" => $data
-], JSON_PRETTY_PRINT);
+    'status'   => true,
+    'page'     => $page,
+    'par_page' => $per_page, // match Laravel
+    'total'    => $total,
+    'data'     => $leaderboard
+]);

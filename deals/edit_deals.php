@@ -9,6 +9,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' && $_SERVER['REQUEST_METHOD'] !== 'PUT
 
 // ===== Database Connection =====
 require_once 'conn.php';
+require_once 'config.php';
 
 
 // ===== Get JSON Data =====
