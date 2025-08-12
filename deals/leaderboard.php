@@ -87,10 +87,27 @@ if (!empty($state_for_search)) {
     }
 }
 
+
 if (!empty($industries_for_search)) {
     $placeholders = implode(',', array_fill(0, count($industries_for_search), '?'));
     $sql_base .= " AND u.industry IN ($placeholders)";
     $params = array_merge($params, $industries_for_search);
+
+    // ADD THIS: Only include users who have at least one deal
+    $sql_base .= " AND EXISTS (
+        SELECT 1 FROM deals d2 WHERE d2.owner = u.id AND d2.deleted_at IS NULL
+    )";
+}
+
+// 🔍 Filter by id: only if that id has deals, otherwise no records
+if ($id && is_numeric($id)) {
+    $sql_base .= " AND u.id = ?";
+    $params[] = (int)$id;
+
+    // ADD THIS: Check if user has deals, else no results
+    $sql_base .= " AND EXISTS (
+        SELECT 1 FROM deals d3 WHERE d3.owner = u.id AND d3.deleted_at IS NULL
+    )";
 }
 
 if (!empty($practice_areas_for_search)) {
