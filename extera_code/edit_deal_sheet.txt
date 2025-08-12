@@ -1,3 +1,8 @@
+
+<!--  
+this is show user_id update the deal_sheet throw id and same as  fetching the record
+ using id update id , title , description , user_id   --> 
+
 <?php
 header("Content-Type: application/json; charset=UTF-8");
 require_once 'conn.php';
@@ -125,6 +130,144 @@ $stmt = $conn->prepare($sql);
 $updated = $stmt->execute($params);
 
 if ($updated) {
+    $stmt = $conn->prepare("SELECT * FROM deal_sheets WHERE id = ?");
+    $stmt->execute([$id]);
+    $updatedDeal = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    echo json_encode([
+        "status" => true,
+        "message" => "Deal sheet updated successfully.",
+        "data" => $updatedDeal
+    ]);
+} else {
+    echo json_encode([
+        "status" => false,
+        "message" => "Failed to update deal sheet."
+    ]);
+}
+
+
+
+
+
+
+
+
+
+
+<!--  
+this is show user_id update the deal_sheet throw id and same as  fetching the record
+ using id update id , title , description 
+ 
+
+ ChatGPT said:
+Got it! I’ll provide you a complete edit_deal_sheet.php API that:
+
+Does NOT allow updating user_id (owner is fixed)
+
+Allows updating title and descriptions
+
+Returns existing data if no update fields sent
+
+Proper validation & error handling
+
+Then, I’ll give you step-by-step testing instructions for Postman.
+
+
+
+<?php
+header("Content-Type: application/json; charset=UTF-8");
+require_once 'conn.php'; // your DB connection
+
+// Only allow POST requests
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    echo json_encode([
+        "status" => false,
+        "message" => "Invalid request method. Use POST only."
+    ]);
+    exit();
+}
+
+// Get input JSON or POST data
+$input = json_decode(file_get_contents("php://input"), true);
+if (!is_array($input)) {
+    $input = $_POST;
+}
+
+function getParam($key, $default = null) {
+    global $input;
+    return isset($input[$key]) && $input[$key] !== '' ? trim($input[$key]) : $default;
+}
+
+$id = getParam('id');
+if (!$id || !is_numeric($id)) {
+    echo json_encode([
+        "status" => false,
+        "message" => "Valid deal sheet ID is required."
+    ]);
+    exit();
+}
+
+// Fields allowed to update
+$title = getParam('title');
+$descriptions = getParam('descriptions');
+
+// Check if deal sheet exists and not deleted
+$stmt = $conn->prepare("SELECT * FROM deal_sheets WHERE id = ? AND deleted_at IS NULL");
+$stmt->execute([$id]);
+$deal = $stmt->fetch(PDO::FETCH_ASSOC);
+
+if (!$deal) {
+    echo json_encode([
+        "status" => false,
+        "message" => "Deal sheet not found."
+    ]);
+    exit();
+}
+
+// If no update fields sent, return existing data
+if ($title === null && $descriptions === null) {
+    echo json_encode([
+        "status" => true,
+        "message" => "Deal sheet fetched successfully. No update made.",
+        "data" => $deal
+    ]);
+    exit();
+}
+
+// Build dynamic update query
+$fields = [];
+$params = [];
+
+if ($title !== null) {
+    $fields[] = "title = ?";
+    $params[] = $title;
+}
+
+if ($descriptions !== null) {
+    $fields[] = "descriptions = ?";
+    $params[] = $descriptions;
+}
+
+if (count($fields) === 0) {
+    echo json_encode([
+        "status" => false,
+        "message" => "No valid fields provided to update."
+    ]);
+    exit();
+}
+
+// Add updated_at timestamp
+$fields[] = "updated_at = NOW()";
+
+$sql = "UPDATE deal_sheets SET " . implode(", ", $fields) . " WHERE id = ?";
+$params[] = $id;
+
+$stmt = $conn->prepare($sql);
+$updated = $stmt->execute($params);
+
+if ($updated) {
+    // Return updated deal sheet
     $stmt = $conn->prepare("SELECT * FROM deal_sheets WHERE id = ?");
     $stmt->execute([$id]);
     $updatedDeal = $stmt->fetch(PDO::FETCH_ASSOC);
