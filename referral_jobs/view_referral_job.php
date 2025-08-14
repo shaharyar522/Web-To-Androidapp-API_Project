@@ -2,7 +2,7 @@
 // view_referral_job.php
 
 header('Content-Type: application/json');
-include_once 'conn.php'; // your PDO connection
+include_once 'connection.php'; // your PDO connection
 
 if($_SERVER['REQUEST_METHOD'] === 'POST') {
 
