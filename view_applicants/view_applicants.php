@@ -1,103 +1,78 @@
 <?php
-header('Content-Type: application/json');
-include_once 'connection.php';
+header("Content-Type: application/json");
+include 'connection.php';
 
-// Read POST form-data
-$id            = isset($_POST['id']) ? intval($_POST['id']) : 0;
-$owner_id      = isset($_POST['owner_id']) ? intval($_POST['owner_id']) : 0;
-$status        = isset($_POST['status']) ? trim($_POST['status']) : '';
-$job_id        = isset($_POST['job_id']) ? intval($_POST['job_id']) : 0;
-$applicant_id  = isset($_POST['applicant_id']) ? intval($_POST['applicant_id']) : 0;
+// Get search query and pagination
+$search = isset($_GET['q']) ? trim($_GET['q']) : '';
+$page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+$limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 10;
+$offset = ($page - 1) * $limit;
 
-// Base SQL query
-$sql = "
-SELECT 
-    ja.id,
-    ja.owner_id,
-    ja.applicant_id,
-    ja.platform_percentage,
-    ja.job_id,
-    ja.apply_date,
-    ja.status,
-    ja.is_shortlisted,
-    ja.is_rijected,
-    ja.hired_at,
-    ja.application_step,
-    ja.accepted_date,
-    ja.completed_at,
-    ja.paid_amount,
-    ja.payment_at,
-    ja.owner_review,
-    ja.owner_review_at,
-    ja.employee_review,
-    ja.employee_review_at,
-    ja.created_at,
-    ja.updated_at,
-    u.username,
-    u.first_name,
-    u.last_name,
-    CONCAT(u.first_name, ' ', u.last_name) AS applicant_name,
-    u.email AS applicant_email,
-    eq.title AS job_title,
-    eq.descriptions AS job_description
-FROM job_applications ja
-JOIN users u ON u.id = ja.applicant_id
-JOIN eq_jobs eq ON eq.id = ja.job_id
-WHERE 1=1
-";
-
-// Apply filters dynamically
-if ($id > 0) {
-    $sql .= " AND ja.id = :id";
-}
-if ($owner_id > 0) {
-    $sql .= " AND ja.owner_id = :owner_id";
-}
-if (!empty($status)) {
-    $sql .= " AND ja.status = :status";
-}
-if ($job_id > 0) {
-    $sql .= " AND ja.job_id = :job_id";
-}
-if ($applicant_id > 0) {
-    $sql .= " AND ja.applicant_id = :applicant_id";
-}
-
-$sql .= " ORDER BY ja.created_at ASC";
-
-try {
-    $stmt = $pdo->prepare($sql);
-
-    // Bind only provided parameters
-    if ($id > 0) {
-        $stmt->bindParam(':id', $id, PDO::PARAM_INT);
+// Helper function to check if table exists
+function tableExists($conn, $table) {
+    try {
+        $result = $conn->query("SELECT 1 FROM $table LIMIT 1");
+        return $result !== false;
+    } catch (PDOException $e) {
+        return false;
     }
-    if ($owner_id > 0) {
-        $stmt->bindParam(':owner_id', $owner_id, PDO::PARAM_INT);
-    }
-    if (!empty($status)) {
-        $stmt->bindParam(':status', $status, PDO::PARAM_STR);
-    }
-    if ($job_id > 0) {
-        $stmt->bindParam(':job_id', $job_id, PDO::PARAM_INT);
-    }
-    if ($applicant_id > 0) {
-        $stmt->bindParam(':applicant_id', $applicant_id, PDO::PARAM_INT);
-    }
-
-    $stmt->execute();
-    $applicants = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    echo json_encode([
-        "status" => "success",
-        "total" => count($applicants),
-        "data" => $applicants
-    ], JSON_PRETTY_PRINT);
-
-} catch (PDOException $e) {
-    echo json_encode([
-        "status" => "error",
-        "message" => $e->getMessage()
-    ]);
 }
+
+// Helper function to search table
+function searchTable($conn, $table, $columns, $query, $limit, $offset) {
+    if (!tableExists($conn, $table)) {
+        return [];
+    }
+    try {
+        if ($query) {
+            $likeQuery = '%' . $query . '%';
+            $where = implode(" OR ", array_map(fn($c) => "$c LIKE :query", $columns));
+            $sql = "SELECT * FROM $table WHERE $where LIMIT :limit OFFSET :offset";
+            $stmt = $conn->prepare($sql);
+            $stmt->bindParam(':query', $likeQuery);
+        } else {
+            $sql = "SELECT * FROM $table LIMIT :limit OFFSET :offset";
+            $stmt = $conn->prepare($sql);
+        }
+        $stmt->bindParam(':limit', $limit, PDO::PARAM_INT);
+        $stmt->bindParam(':offset', $offset, PDO::PARAM_INT);
+        $stmt->execute();
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+// ===== SEARCH ALL TABLES =====
+$results = [];
+
+// People
+$results['people'] = searchTable($conn, 'users', ['name', 'email'], $search, $limit, $offset);
+
+// Deals
+$results['deals'] = searchTable($conn, 'deals', ['title', 'description'], $search, $limit, $offset);
+
+// Referrals
+$results['referrals'] = searchTable($conn, 'referrals', ['title', 'details'], $search, $limit, $offset);
+
+// Jobs
+$results['jobs'] = searchTable($conn, 'jobs', ['title', 'description'], $search, $limit, $offset);
+
+// Posts
+$results['posts'] = searchTable($conn, 'posts', ['title', 'content'], $search, $limit, $offset);
+
+// Files (Feed + Messages)
+$feedFiles = searchTable($conn, 'feed_media', ['file_name', 'description'], $search, $limit, $offset);
+$messageFiles = searchTable($conn, 'messages', ['file_name', 'message'], $search, $limit, $offset);
+$results['files'] = array_merge($feedFiles, $messageFiles);
+
+// Return JSON
+echo json_encode([
+    "status" => true,
+    "data" => $results,
+    "pagination" => [
+        "page" => $page,
+        "limit" => $limit
+    ]
+]);
 ?>

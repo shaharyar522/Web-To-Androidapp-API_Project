@@ -1,3 +1,6 @@
+
+view_all_result.php
+
 <?php
 header("Content-Type: application/json");
 include 'connection.php';
@@ -77,3 +80,7 @@ echo json_encode([
     ]
 ]);
 ?>
+
+
+/////////////////////////////////////
+
