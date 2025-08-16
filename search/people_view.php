@@ -1,3 +1,4 @@
+
 <?php
 header("Content-Type: application/json");
 
@@ -27,13 +28,19 @@ $people_page = isset($_POST['people_page']) ? (int)$_POST['people_page'] : 1;
 $people_per_page = isset($_POST['people_per_page']) ? (int)$_POST['people_per_page'] : 10;
 $hasSearch = !empty($searchValue);
 
+// ===== Pagination values =====
+$offset = ($people_page - 1) * $people_per_page;
+
+
 // ===== Fetch People =====
 try {
-    $sql = "SELECT id, first_name, last_name, email, phone, law_firm, practice_area, city, industry, created_at 
+    // Base query
+    $sql = "SELECT SQL_CALC_FOUND_ROWS id, first_name, last_name, email, phone, law_firm, practice_area, city, industry, created_at 
             FROM users 
             WHERE deleted_at IS NULL";
     $params = [];
 
+    // Search conditions
     if ($hasSearch) {
         $sql .= " AND (
             LOWER(first_name) LIKE :search 
@@ -46,11 +53,32 @@ try {
         $params[':search'] = "%" . strtolower($searchValue) . "%";
     }
 
+    // Sorting
+    if ($hasSearch) {
+        // When searching, initial sort by created_at (accuracy handled later)
+        $sql .= " ORDER BY created_at DESC";
+    } else {
+        // Default sort
+        $sql .= " ORDER BY created_at DESC";
+    }
+
+    // Pagination in SQL
+    $sql .= " LIMIT :limit OFFSET :offset";
+
     $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
+    foreach ($params as $key => $val) {
+        $stmt->bindValue($key, $val, PDO::PARAM_STR);
+    }
+    $stmt->bindValue(':limit', $people_per_page, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+
     $peoples = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // ===== Join City =====
+    // Get total rows
+    $total = $conn->query("SELECT FOUND_ROWS()")->fetchColumn();
+
+    // ===== Join City & Industry =====
     foreach ($peoples as &$person) {
         if (!empty($person['city'])) {
             $cityStmt = $conn->prepare("SELECT id, name FROM citys WHERE id = ?");
@@ -60,7 +88,6 @@ try {
             $person['cityInfo'] = null;
         }
 
-        // Industry
         if (!empty($person['industry'])) {
             $indStmt = $conn->prepare("SELECT id, title FROM industrys WHERE id = ?");
             $indStmt->execute([$person['industry']]);
@@ -110,29 +137,29 @@ try {
         return 0;
     }
 
-    foreach ($peoples as &$person) {
-        $fields = ['first_name','last_name','email','phone','law_firm','practice_area','cityInfo.name','industryInfo.title'];
-        $person['accuracy_score'] = $hasSearch ? calculateMatchScore($person, $fields, $searchValue) : 0;
-    }
-
-    // ===== Sort & Paginate =====
     if ($hasSearch) {
+        foreach ($peoples as &$person) {
+            $fields = ['first_name','last_name','email','phone','law_firm','practice_area','cityInfo.name','industryInfo.title'];
+            $person['accuracy_score'] = calculateMatchScore($person, $fields, $searchValue);
+        }
+        // Keep only matches
         $peoples = array_filter($peoples, fn($p) => $p['accuracy_score'] > 0);
+        // Sort by score
         usort($peoples, fn($a,$b) => $b['accuracy_score'] <=> $a['accuracy_score']);
     } else {
-        usort($peoples, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+        foreach ($peoples as &$person) {
+            $person['accuracy_score'] = 0;
+        }
     }
-
-    $total_people = count($peoples);
-    $peoples = array_slice($peoples, ($people_page - 1) * $people_per_page, $people_per_page);
 
     // ===== Response =====
     echo json_encode([
         "status" => true,
-        "total" => $total_people,
+        "total" => (int)$total,
+        "total_pages" => ceil($total / $people_per_page),
         "page" => $people_page,
         "per_page" => $people_per_page,
-        "data" => $peoples
+        "data" => array_values($peoples)
     ]);
 
 } catch (Exception $e) {
