@@ -1,182 +1,125 @@
 <?php
 header("Content-Type: application/json");
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization");
+require_once("connection.php"); // your DB connection
 
-// ===== Database Connection =====
-$host = "localhost";
-$db_name = "esqify_db";
-$username = "root";
-$password = "";
+// Pagination params
+$page     = isset($_GET['page']) ? (int) $_GET['page'] : 1;
+$per_page = isset($_GET['per_page']) ? (int) $_GET['per_page'] : 10;
+$search   = isset($_POST['search']) ? strtolower(trim($_POST['search'])) : '';
+$hasSearch = !empty($search);
 
-try {
-    $pdo = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch (PDOException $e) {
-    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
-    exit();
+// Calculate offset
+$offset = ($page - 1) * $per_page;
+
+// Fetch referrals base query
+$sql = "SELECT r.*, 
+               c.name AS city_name, 
+               i.title AS industry_title,
+               ow.first_name AS owner_first_name, ow.last_name AS owner_last_name,
+               ref.first_name AS referred_first_name, ref.last_name AS referred_last_name,
+               b.keywords AS boost_keywords
+        FROM eq_jobs r
+        LEFT JOIN citys c ON r.job_city = c.id
+        LEFT JOIN industrys i ON r.industry = i.id
+        LEFT JOIN users ow ON r.owner = ow.id
+        LEFT JOIN users ref ON r.referred_by = ref.id
+        LEFT JOIN boosts b ON r.id = b.product_id AND b.model = 'job'
+        WHERE r.deleted_at IS NULL
+          AND r.job_type = 'referral'";
+
+if ($hasSearch) {
+    $sql .= " AND (
+                LOWER(r.title) LIKE :search
+                OR LOWER(r.descriptions) LIKE :search
+                OR LOWER(r.notes) LIKE :search
+                OR LOWER(r.firm) LIKE :search
+                OR LOWER(r.position) LIKE :search
+                OR LOWER(r.representative) LIKE :search
+                OR LOWER(c.name) LIKE :search
+                OR LOWER(i.title) LIKE :search
+                OR LOWER(ow.first_name) LIKE :search
+                OR LOWER(ow.last_name) LIKE :search
+                OR LOWER(ref.first_name) LIKE :search
+                OR LOWER(ref.last_name) LIKE :search
+                OR LOWER(b.keywords) LIKE :search
+              )";
 }
 
-// ===== Helper: JSON Response =====
-function response($data, $status = 200) {
-    http_response_code($status);
-    echo json_encode($data);
-    exit;
+$stmt = $conn->prepare($sql);
+
+if ($hasSearch) {
+    $like = "%{$search}%";
+    $stmt->bindParam(":search", $like);
 }
 
-// ===== Helper: Match Score =====
-function calculateMatchScore($row, $fields, $searchValue) {
+$stmt->execute();
+$results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Calculate accuracy_score
+function calculateMatchScore($item, $searchValue) {
+    $fields = [
+        $item['title'] ?? '',
+        $item['descriptions'] ?? '',
+        $item['notes'] ?? '',
+        $item['firm'] ?? '',
+        $item['position'] ?? '',
+        $item['representative'] ?? '',
+        $item['city_name'] ?? '',
+        $item['industry_title'] ?? '',
+        $item['owner_first_name'] ?? '',
+        $item['owner_last_name'] ?? '',
+        $item['referred_first_name'] ?? '',
+        $item['referred_last_name'] ?? '',
+        $item['boost_keywords'] ?? ''
+    ];
+
+    $combined = strtolower(implode(' ', $fields));
     $searchValue = strtolower(trim($searchValue));
-    $searchWords = preg_split('/\s+/', $searchValue);
+    $words = preg_split('/\s+/', $searchValue);
 
-    $combinedValue = '';
-    foreach ($fields as $field) {
-        if (!empty($row[$field])) {
-            $combinedValue .= ' ' . strtolower($row[$field]);
-        }
-    }
-
-    if (str_contains($combinedValue, $searchValue)) {
+    if (str_contains($combined, $searchValue)) {
         return 100;
     }
 
-    $foundWords = 0;
-    foreach ($searchWords as $word) {
-        if (str_contains($combinedValue, $word)) {
-            $foundWords++;
+    $found = 0;
+    foreach ($words as $w) {
+        if (str_contains($combined, $w)) {
+            $found++;
         }
     }
+    $total = count($words);
 
-    if ($foundWords === count($searchWords) && $foundWords > 0) {
+    if ($found === $total && $total > 1) {
         return 100;
     }
-    if ($foundWords > 0) {
-        return intval(50 * ($foundWords / count($searchWords)));
+    if ($found > 0) {
+        return intval(50 * ($found / $total));
     }
-
     return 0;
 }
 
-// ===== Parse URL (PATH_INFO / GET / fallback) =====
-$pathInfo = $_SERVER["PATH_INFO"] ?? "";
-$request = explode("/", trim($pathInfo, "/"));
-$resource = $request[0] ?? ($_GET['resource'] ?? null);
-$id = $request[1] ?? ($_GET['id'] ?? null);
-
-// ✅ Default fallback: if no resource given, assume "referrals"
-if (!$resource) {
-    $resource = "referrals";
+// Add accuracy_score
+foreach ($results as &$r) {
+    $r['accuracy_score'] = $hasSearch ? calculateMatchScore($r, $search) : 0;
 }
 
-$method = $_SERVER['REQUEST_METHOD'];
-
-// ===== Referrals API =====
-if ($resource === "referrals") {
-    switch ($method) {
-        case "GET":
-            if ($id) {
-                // 🔹 Single referral
-                $stmt = $pdo->prepare("SELECT * FROM eq_jobs WHERE id = ? AND job_type = 'referral' AND deleted_at IS NULL");
-                $stmt->execute([$id]);
-                $referral = $stmt->fetch(PDO::FETCH_ASSOC);
-
-                if ($referral) {
-                    response(["status" => true, "data" => $referral]);
-                } else {
-                    response(["status" => false, "message" => "Referral not found"], 404);
-                }
-            } else {
-                // 🔹 List/search referrals
-                $search = strtolower($_GET['search'] ?? '');
-                $perPage = intval($_GET['per_page'] ?? 10);
-                $page = intval($_GET['page'] ?? 1);
-                $offset = ($page - 1) * $perPage;
-
-                $sql = "SELECT * FROM eq_jobs WHERE job_type = 'referral' AND deleted_at IS NULL";
-                $stmt = $pdo->query($sql);
-                $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-                if (!empty($search)) {
-                    foreach ($rows as &$row) {
-                        $row['accuracy_score'] = calculateMatchScore(
-                            $row,
-                            ['title', 'descriptions', 'notes', 'firm', 'position', 'representative'],
-                            $search
-                        );
-                    }
-                    $rows = array_filter($rows, fn($r) => $r['accuracy_score'] > 0);
-                    usort($rows, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
-                } else {
-                    usort($rows, fn($a, $b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
-                }
-
-                $total = count($rows);
-                $rows = array_slice($rows, $offset, $perPage);
-
-                response([
-                    "status" => true,
-                    "page" => $page,
-                    "per_page" => $perPage,
-                    "total" => $total,
-                    "data" => array_values($rows)
-                ]);
-            }
-            break;
-
-        case "POST":
-            $input = json_decode(file_get_contents("php://input"), true);
-            if (empty($input['title'])) {
-                response(["status" => false, "message" => "Title is required"], 400);
-            }
-
-            $stmt = $pdo->prepare("INSERT INTO eq_jobs (title, descriptions, firm, position, representative, job_type, created_at) 
-                                   VALUES (?, ?, ?, ?, ?, 'referral', NOW())");
-            $stmt->execute([
-                $input['title'],
-                $input['descriptions'] ?? null,
-                $input['firm'] ?? null,
-                $input['position'] ?? null,
-                $input['representative'] ?? null
-            ]);
-
-            response(["status" => true, "message" => "Referral created", "id" => $pdo->lastInsertId()], 201);
-            break;
-
-        case "PUT":
-            if (!$id) {
-                response(["status" => false, "message" => "ID required"], 400);
-            }
-            $input = json_decode(file_get_contents("php://input"), true);
-
-            $stmt = $pdo->prepare("UPDATE eq_jobs 
-                                   SET title=?, descriptions=?, firm=?, position=?, representative=?, updated_at=NOW() 
-                                   WHERE id=? AND job_type='referral'");
-            $stmt->execute([
-                $input['title'] ?? null,
-                $input['descriptions'] ?? null,
-                $input['firm'] ?? null,
-                $input['position'] ?? null,
-                $input['representative'] ?? null,
-                $id
-            ]);
-
-            response(["status" => true, "message" => "Referral updated"]);
-            break;
-
-        case "DELETE":
-            if (!$id) {
-                response(["status" => false, "message" => "ID required"], 400);
-            }
-            $stmt = $pdo->prepare("UPDATE eq_jobs SET deleted_at=NOW() WHERE id=? AND job_type='referral'");
-            $stmt->execute([$id]);
-
-            response(["status" => true, "message" => "Referral deleted"]);
-            break;
-
-        default:
-            response(["status" => false, "message" => "Method not allowed"], 405);
-    }
+// Filter + sort
+if ($hasSearch) {
+    $results = array_filter($results, fn($r) => $r['accuracy_score'] > 0);
+    usort($results, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
 } else {
-    response(["status" => false, "message" => "Resource not found"], 404);
+    usort($results, fn($a, $b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
 }
+
+// Pagination slice
+$total = count($results);
+$results = array_slice($results, $offset, $per_page);
+
+// Response
+echo json_encode([
+    "status" => true,
+    "page" => $page,
+    "per_page" => $per_page,
+    "total" => $total,
+    "data" => array_values($results)
+]);
