@@ -1,18 +1,37 @@
 <?php
-// deal_view.php  — custom PHP version of your controller's Deal flow
-
+// deal_view.php — POST-only, mirrors your Laravel SearchController -> Deal section exactly
 header('Content-Type: application/json');
 include("connection.php"); // must provide $conn = new PDO(...)
 
-// -------------------- Inputs --------------------
-$searchValue = isset($_POST['searchValue']) ? trim($_POST['searchValue']) : '';
-$dealsPage   = isset($_POST['deals_page']) ? max(1, intval($_POST['deals_page'])) : 1;
-$perPage     = isset($_POST['per_page']) ? max(1, intval($_POST['per_page'])) : 10;
-$hasSearch   = $searchValue !== '';
+// -------------------- Only allow POST --------------------
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode([
+        'status'  => false,
+        'message' => 'Only POST method is allowed'
+    ]);
+    exit;
+}
+
+// -------------------- Read POST params --------------------
+function post_param(array $keys, $default = null) {
+    foreach ($keys as $k) {
+        if (isset($_POST[$k]) && $_POST[$k] !== '') {
+            return trim($_POST[$k]);
+        }
+    }
+    return $default;
+}
+
+$searchValue = post_param(['search_value', 'searchValue', 'q'], '');
 $searchValueLower = strtolower($searchValue);
+$hasSearch = $searchValue !== '';
+
+$current_page = max(1, intval(post_param(['current_page', 'deals_page', 'page'], 1)));
+$per_page = max(1, intval(post_param(['per_page', 'deal_par_page', 'perPage'], 10)));
 
 // -------------------- Helpers --------------------
-/** Laravel-like data_get for arrays with dot notation */
+/** dot-notated getter for arrays (ownerInfo.first_name style) */
 function data_get_dot(array $arr, string $path) {
     $segments = explode('.', $path);
     $cur = $arr;
@@ -26,7 +45,7 @@ function data_get_dot(array $arr, string $path) {
     return $cur;
 }
 
-/** Same accuracy score logic as your controller */
+/** calculateMatchScore as in your controller */
 function calculateMatchScoreArray(array $item, array $fields, string $searchValue): int {
     $searchValue = strtolower(trim($searchValue));
     $searchWords = preg_split('/\s+/', $searchValue);
@@ -35,7 +54,7 @@ function calculateMatchScoreArray(array $item, array $fields, string $searchValu
     foreach ($fields as $field) {
         $value = data_get_dot($item, $field);
         if ($value !== null && $value !== '') {
-            $combinedValue .= ' ' . strtolower($value);
+            $combinedValue .= ' ' . strtolower((string)$value);
         }
     }
     $combinedValue = trim($combinedValue);
@@ -53,14 +72,14 @@ function calculateMatchScoreArray(array $item, array $fields, string $searchValu
         }
     }
 
-    $totalWords = count(array_filter($searchWords, fn($w) => $w !== ''));
+    $totalWords = count(array_filter($searchWords, fn($w) => trim($w) !== ''));
     if ($totalWords > 1 && $foundWords === $totalWords) return 100;
     if ($foundWords > 0 && $totalWords > 0) return intval(50 * ($foundWords / $totalWords));
 
     return 0;
 }
 
-/** Paginate an array after sorting (same overall flow as controller) */
+/** paginate like LengthAwarePaginator over an array (controller does this after sorting) */
 function paginateArray(array $data, int $page, int $perPage): array {
     $total   = count($data);
     $offset  = ($page - 1) * $perPage;
@@ -69,14 +88,14 @@ function paginateArray(array $data, int $page, int $perPage): array {
         'data'         => array_values($slice),
         'total'        => $total,
         'per_page'     => $perPage,
-        'current_page' => $page,
+         'page'     => $page,
         'last_page'    => (int) ceil($total / $perPage),
     ];
 }
 
+// -------------------- Main flow --------------------
 try {
-    // -------------------- Build base SQL like your Eloquent with() + whereNull --------------------
-    // NOTE: change FK names if needed (practicearea_id, speciality_id, industry_id, user_id)
+    // Build SQL using your exact table & column names
     $sql = "
         SELECT
             d.id,
@@ -90,28 +109,25 @@ try {
             d.company_name,
             d.status,
             d.created_at,
-
             pa.title  AS practicearea_title,
             sp.title  AS speciality_title,
             ind.title AS industry_title,
-
             u.first_name AS owner_first_name,
             u.last_name  AS owner_last_name
         FROM deals d
-        LEFT JOIN practiceareas pa ON pa.id = d.practicearea_id
-        LEFT JOIN specialities sp  ON sp.id  = d.speciality_id
-        LEFT JOIN industries ind   ON ind.id = d.industry_id
-        LEFT JOIN users u          ON u.id   = d.user_id
+        LEFT JOIN practice_areas pa ON pa.id = d.practice_area
+        LEFT JOIN specialties sp    ON sp.id  = d.speciality
+        LEFT JOIN industrys ind     ON ind.id = d.industry
+        LEFT JOIN users u           ON u.id   = d.owner
         WHERE d.deleted_at IS NULL
     ";
 
     $params = [];
     if ($hasSearch) {
-        // mirror controller search:
-        // where title/descriptions/notes OR specialityinfo.title matches (lower)
+        // match controller's active where clauses
         $sql .= "
             AND (
-                LOWER(d.title)        LIKE :q
+                LOWER(d.title)          LIKE :q
                 OR LOWER(d.descriptions) LIKE :q
                 OR LOWER(d.notes)        LIKE :q
                 OR LOWER(sp.title)       LIKE :q
@@ -120,8 +136,7 @@ try {
         $params[':q'] = '%' . $searchValueLower . '%';
     }
 
-    // Fetch ALL matching deals first (controller fetches then sorts/paginates in PHP)
-    // No ORDER BY here; we'll sort in PHP like your controller
+    // fetch all matching rows (controller fetches the collection and then scores/sorts in PHP)
     $stmt = $conn->prepare($sql);
     foreach ($params as $k => $v) {
         $stmt->bindValue($k, $v, PDO::PARAM_STR);
@@ -129,7 +144,7 @@ try {
     $stmt->execute();
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // -------------------- Transform rows to match controller shape (nested relations) --------------------
+    // map rows into the same shape controller expects (with nested relations)
     $deals = [];
     foreach ($rows as $r) {
         $deal = [
@@ -144,24 +159,16 @@ try {
             'company_name'  => $r['company_name'],
             'status'        => $r['status'],
             'created_at'    => $r['created_at'],
-
-            // relations as nested arrays to mirror Eloquent access (practicearea.title etc.)
             'ownerInfo'     => [
                 'first_name' => $r['owner_first_name'],
                 'last_name'  => $r['owner_last_name'],
             ],
-            'practicearea'  => [
-                'title' => $r['practicearea_title'],
-            ],
-            'specialityinfo'=> [
-                'title' => $r['speciality_title'],
-            ],
-            'industryinfo'  => [
-                'title' => $r['industry_title'],
-            ],
+            'practicearea'  => ['title' => $r['practicearea_title']],
+            'specialityinfo'=> ['title' => $r['speciality_title']],
+            'industryinfo'  => ['title' => $r['industry_title']],
         ];
 
-        // accuracy_score like controller (fields list below is identical)
+        // compute accuracy_score using the exact fields list your controller uses
         $scoreFields = [
             'title',
             'descriptions',
@@ -185,9 +192,9 @@ try {
         $deals[] = $deal;
     }
 
-    // -------------------- Filter & Sort (exactly like your controller) --------------------
+    // Filter & Sort exactly like controller
     if ($hasSearch) {
-        // keep only > 0
+        // keep only accuracy_score > 0
         $deals = array_values(array_filter($deals, fn($d) => (int)$d['accuracy_score'] > 0));
         // sort by accuracy_score desc
         usort($deals, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
@@ -200,20 +207,22 @@ try {
         });
     }
 
-    // -------------------- Paginate AFTER sorting (same as LengthAwarePaginator over a collection) --------------------
-    $dealsPaginated = paginateArray($deals, $dealsPage, $perPage);
+    // Paginate AFTER sorting (just like LengthAwarePaginator on the collection)
+    $dealsPaginated = paginateArray($deals, $current_page, $per_page);
 
-    // -------------------- Response --------------------
+    // Response: mirrors your controller's collection pagination shape
     echo json_encode([
         'status'         => true,
         'searchValue'    => $searchValue,
-        'total_results'  => count($deals),         // total after filtering (same as your controller's count())
-        'deals_paginated'=> $dealsPaginated,       // contains data, total, per_page, current_page, last_page
+        'total_results'  => count($deals),
+        'deals_paginated'=> $dealsPaginated,
     ], JSON_PRETTY_PRINT);
 
 } catch (PDOException $e) {
+    http_response_code(500);
     echo json_encode([
         'status'  => false,
         'message' => 'Database error: ' . $e->getMessage(),
     ], JSON_PRETTY_PRINT);
+    exit;
 }
