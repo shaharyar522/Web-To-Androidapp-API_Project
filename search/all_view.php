@@ -300,8 +300,8 @@ try {
 
 // ----- Section: PEOPLES (users role_id = 3) -----
 try {
-    $peoplesSql = "SELECT id, first_name, last_name, email, city, law_firm, image, address, intro, bio, created_at
-                   FROM users WHERE deleted_at IS NULL AND role_id = 3";
+    $peoplesSql = "SELECT id, first_name, last_name, email, city, industry, law_firm, image, address, intro, bio, created_at
+               FROM users WHERE deleted_at IS NULL AND role_id = 3";
     $peoplesParams = [];
     if ($hasSearch) {
         $peoplesSql .= " AND (
