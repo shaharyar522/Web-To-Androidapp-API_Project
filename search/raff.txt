@@ -84,3 +84,184 @@ echo json_encode([
 
 /////////////////////////////////////
 
+
+
+<?php
+header("Content-Type: application/json");
+
+// ===== Database Connection =====
+$host = "localhost";
+$db_name = "esqify_db";
+$username = "root";
+$password = "";
+
+try {
+    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password);
+    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
+    exit();
+}
+
+// ===== Only POST Method =====
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    echo json_encode(["status" => false, "message" => "Only POST method allowed"]);
+    exit();
+}
+
+// ===== Input =====
+$searchValue   = isset($_POST['search']) ? trim($_POST['search']) : '';
+$hasSearch     = !empty($searchValue);
+
+// Pagination inputs (each section can be paginated independently)
+$params = [
+    "posts_page"     => isset($_POST['posts_page']) ? (int)$_POST['posts_page'] : 1,
+    "post_per_page"  => isset($_POST['post_per_page']) ? (int)$_POST['post_per_page'] : 10,
+    "peoples_page"   => isset($_POST['peoples_page']) ? (int)$_POST['peoples_page'] : 1,
+    "people_per_page"=> isset($_POST['people_per_page']) ? (int)$_POST['people_per_page'] : 10,
+    "referrals_page" => isset($_POST['referrals_page']) ? (int)$_POST['referrals_page'] : 1,
+    "referral_per_page"=> isset($_POST['referral_per_page']) ? (int)$_POST['referral_per_page'] : 10,
+    "jobs_page"      => isset($_POST['jobs_page']) ? (int)$_POST['jobs_page'] : 1,
+    "job_per_page"   => isset($_POST['job_per_page']) ? (int)$_POST['job_per_page'] : 10,
+    "deals_page"     => isset($_POST['deals_page']) ? (int)$_POST['deals_page'] : 1,
+    "deal_per_page"  => isset($_POST['deal_per_page']) ? (int)$_POST['deal_per_page'] : 10,
+];
+
+// ===== Accuracy Score =====
+function calculateMatchScore($row, $fields, $searchValue) {
+    $score = 0;
+    $searchValue = strtolower($searchValue);
+    $searchWords = preg_split('/\s+/', $searchValue);
+
+    foreach ($fields as $field) {
+        $value = $row;
+        foreach (explode('.', $field) as $k) {
+            $value = isset($value[$k]) ? $value[$k] : null;
+        }
+        if ($value) {
+            $value = strtolower($value);
+            if (strpos($value, $searchValue) !== false) {
+                $score += 100;
+                continue;
+            }
+            $foundWords = 0;
+            foreach ($searchWords as $word) {
+                if (strpos($value, $word) !== false) {
+                    $foundWords++;
+                }
+            }
+            if ($foundWords > 0) {
+                $score += intval(50 * ($foundWords / count($searchWords)));
+            }
+        }
+    }
+    return $score;
+}
+
+// ===== Helper: Fetch & Paginate =====
+function fetchAndPaginate($conn, $sql, $searchFields, $pagination, $searchValue, $hasSearch) {
+    $stmt = $conn->prepare($sql['query']);
+    $stmt->execute($sql['params']);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($rows as &$row) {
+        $row['accuracy_score'] = $hasSearch ? calculateMatchScore($row, $searchFields, $searchValue) : 0;
+    }
+
+    if ($hasSearch) {
+        $rows = array_filter($rows, fn($r) => $r['accuracy_score'] > 0);
+        usort($rows, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
+    } else {
+        if (isset($rows[0]['created_at'])) {
+            usort($rows, fn($a, $b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+        }
+    }
+
+    $total_results = count($rows);
+    $last_page     = (int) ceil($total_results / $pagination['per_page']);
+    $offset        = ($pagination['page'] - 1) * $pagination['per_page'];
+    $rows          = array_slice($rows, $offset, $pagination['per_page']);
+
+    $from = $total_results > 0 ? $offset + 1 : null;
+    $to   = $offset + count($rows);
+
+    return [
+        "total_results" => $total_results,
+        "per_page"      => $pagination['per_page'],
+        "current_page"  => $pagination['page'],
+        "last_page"     => $last_page,
+        "from"          => $from,
+        "to"            => $to,
+        "data"          => $rows
+    ];
+}
+
+// ===== Build SQL for each section =====
+$output = ["status" => true, "searchValue" => $searchValue];
+
+// --- Posts ---
+$sql = [
+    "query" => "SELECT id, title, descriptions, tags, photos, owner, created_at 
+                FROM feeds WHERE deleted_at IS NULL",
+    "params" => []
+];
+if ($hasSearch) {
+    $sql["query"] .= " AND (LOWER(title) LIKE :search OR LOWER(descriptions) LIKE :search OR LOWER(tags) LIKE :search)";
+    $sql["params"][':search'] = "%" . strtolower($searchValue) . "%";
+}
+$output['posts'] = fetchAndPaginate($conn, $sql, ['title','descriptions','tags','photos'], 
+    ["page" => $params['posts_page'], "per_page" => $params['post_per_page']], $searchValue, $hasSearch);
+
+// --- People ---
+$sql = [
+    "query" => "SELECT id, first_name, last_name, email, city, created_at 
+                FROM users WHERE deleted_at IS NULL",
+    "params" => []
+];
+if ($hasSearch) {
+    $sql["query"] .= " AND (LOWER(first_name) LIKE :search OR LOWER(last_name) LIKE :search OR LOWER(email) LIKE :search)";
+    $sql["params"][':search'] = "%" . strtolower($searchValue) . "%";
+}
+$output['peoples'] = fetchAndPaginate($conn, $sql, ['first_name','last_name','email'], 
+    ["page" => $params['peoples_page'], "per_page" => $params['people_per_page']], $searchValue, $hasSearch);
+
+// --- Referrals ---
+$sql = [
+    "query" => "SELECT id, title, descriptions, created_at FROM referrals WHERE deleted_at IS NULL",
+    "params" => []
+];
+if ($hasSearch) {
+    $sql["query"] .= " AND (LOWER(title) LIKE :search OR LOWER(descriptions) LIKE :search)";
+    $sql["params"][':search'] = "%" . strtolower($searchValue) . "%";
+}
+$output['referrals'] = fetchAndPaginate($conn, $sql, ['title','descriptions'], 
+    ["page" => $params['referrals_page'], "per_page" => $params['referral_per_page']], $searchValue, $hasSearch);
+
+// --- Jobs ---
+$sql = [
+    "query" => "SELECT id, title, descriptions, created_at FROM jobs WHERE deleted_at IS NULL",
+    "params" => []
+];
+if ($hasSearch) {
+    $sql["query"] .= " AND (LOWER(title) LIKE :search OR LOWER(descriptions) LIKE :search)";
+    $sql["params"][':search'] = "%" . strtolower($searchValue) . "%";
+}
+$output['jobs'] = fetchAndPaginate($conn, $sql, ['title','descriptions'], 
+    ["page" => $params['jobs_page'], "per_page" => $params['job_per_page']], $searchValue, $hasSearch);
+
+// --- Deals ---
+$sql = [
+    "query" => "SELECT id, title, descriptions, notes, press_release_link, tags, photos, amount, owner, firm, posted_date, 
+                       other_attorneys, client, industry, company_name, state, city, practice_area, speciality, status, created_at 
+                FROM deals WHERE deleted_at IS NULL",
+    "params" => []
+];
+if ($hasSearch) {
+    $sql["query"] .= " AND (LOWER(title) LIKE :search OR LOWER(descriptions) LIKE :search OR LOWER(tags) LIKE :search)";
+    $sql["params"][':search'] = "%" . strtolower($searchValue) . "%";
+}
+$output['deals'] = fetchAndPaginate($conn, $sql, ['title','descriptions','tags'], 
+    ["page" => $params['deals_page'], "per_page" => $params['deal_per_page']], $searchValue, $hasSearch);
+
+// ===== Response =====
+echo json_encode($output);

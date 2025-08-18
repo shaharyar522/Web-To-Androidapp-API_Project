@@ -64,7 +64,8 @@ $stmt->execute();
 $jobs = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Accuracy score function
-function calculateMatchScore($item, $fields, $searchValue) {
+function calculateMatchScore($item, $fields, $searchValue)
+{
     $combined = '';
     foreach ($fields as $f) {
         $combined .= ' ' . ($item[$f] ?? '');
@@ -87,8 +88,17 @@ function calculateMatchScore($item, $fields, $searchValue) {
 
 // Fields for accuracy scoring
 $fields = [
-    'title','descriptions','notes','firm','position','representative',
-    'city_name','industry_title','owner_first_name','owner_last_name','boost_keywords'
+    'title',
+    'descriptions',
+    'notes',
+    'firm',
+    'position',
+    'representative',
+    'city_name',
+    'industry_title',
+    'owner_first_name',
+    'owner_last_name',
+    'boost_keywords'
 ];
 
 // Apply accuracy score
@@ -99,9 +109,9 @@ foreach ($jobs as &$job) {
 // Filter & sort
 if ($hasSearch) {
     $jobs = array_filter($jobs, fn($j) => $j['accuracy_score'] > 0);
-    usort($jobs, fn($a,$b) => $b['accuracy_score'] <=> $a['accuracy_score']);
+    usort($jobs, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
 } else {
-    usort($jobs, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+    usort($jobs, fn($a, $b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
 }
 
 // Pagination
@@ -117,4 +127,3 @@ echo json_encode([
     "total_pages" => ceil($total / $per_page),
     "data" => array_values($jobs_paginated)
 ]);
-?>

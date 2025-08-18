@@ -1,483 +1,590 @@
 <?php
-/**
- * POST-only Search API that mirrors your Laravel SearchController buckets:
- * - posts  (feeds)
- * - peoples (users, role_id = 3)
- * - referrals (eq_jobs.job_type='referral')
- * - jobs (eq_jobs.job_type='regular')
- * - deals (deals)
- *
- * Notes:
- * - Uses the same scoring spirit as your controller (100 on full match, otherwise word-ratio to 50).
- * - Does NOT assume columns that may not exist. It checks INFORMATION_SCHEMA first.
- * - “boosts” keyword search is included when the boosts table/columns are present.
- * - Separate pagination per bucket, plus a merged top section (5 from each), sorted by created_at desc.
- */
+// view_all.php
+// Single-file custom PHP API that mirrors your SearchController behavior.
+// Usage: POST only. Request params (all optional):
+//   search_value
+//   all_par_page (for merged items per page)
+//   post_par_page, posts_page
+//   people_par_page, peoples_page
+//   referrals_par_page, referrals_page
+//   job_par_page, jobs_page
+//   deal_par_page, deals_page
+function appendWithType($rows, $type, $limit = 5) {
+    $result = [];
+    $count = 0;
+    foreach ($rows as $row) {
+        if ($count >= $limit) break;
+        $row['type'] = $type;
+        $result[] = $row;
+        $count++;
+    }
+    return $result;
+}
 
-header('Content-Type: application/json');
+header("Content-Type: application/json; charset=utf-8");
 
-// Enforce POST
+// ----- DB connection (edit if needed) -----
+$host = "localhost";
+$db_name = "esqify_db";
+$username = "root";
+$password = "";
+
+try {
+    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    ]);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
+    exit();
+}
+
+// ----- Only POST -----
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    echo json_encode(['status' => false, 'message' => 'Method Not Allowed. Use POST.']);
-    exit;
+    echo json_encode(["status" => false, "message" => "Only POST method allowed"]);
+    exit();
 }
 
-// DB connection (expects $conn = new PDO(...))
-require_once __DIR__ . '/connection.php';
+// ----- Read inputs -----
+$searchValue = strtolower(trim($_POST['search_value'] ?? ''));
+$hasSearch = $searchValue !== '';
 
-// ---------- Helpers ----------
-function get_current_db(PDO $conn): string {
-    return (string)$conn->query("SELECT DATABASE()")->fetchColumn();
-}
+$perPage = isset($_POST['all_par_page']) ? (int)$_POST['all_par_page'] : 25;
+$post_par_page = isset($_POST['post_par_page']) ? (int)$_POST['post_par_page'] : 9;
+$people_par_page = isset($_POST['people_par_page']) ? (int)$_POST['people_par_page'] : 9;
+$referrals_par_page = isset($_POST['referrals_par_page']) ? (int)$_POST['referrals_par_page'] : 9;
+$job_par_page = isset($_POST['job_par_page']) ? (int)$_POST['job_par_page'] : 9;
+$deal_par_page = isset($_POST['deal_par_page']) ? (int)$_POST['deal_par_page'] : 9;
 
-function table_exists(PDO $conn, string $table): bool {
-    $db = get_current_db($conn);
-    $q = $conn->prepare("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? LIMIT 1");
-    $q->execute([$db, $table]);
-    return (bool)$q->fetchColumn();
-}
+$pages = [
+    'posts_page' => max(1, (int)($_POST['posts_page'] ?? 1)),
+    'peoples_page' => max(1, (int)($_POST['peoples_page'] ?? 1)),
+    'referrals_page' => max(1, (int)($_POST['referrals_page'] ?? 1)),
+    'jobs_page' => max(1, (int)($_POST['jobs_page'] ?? 1)),
+    'deals_page' => max(1, (int)($_POST['deals_page'] ?? 1)),
+];
 
-function column_exists(PDO $conn, string $table, string $column): bool {
-    $db = get_current_db($conn);
-    $q = $conn->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1");
-    $q->execute([$db, $table, $column]);
-    return (bool)$q->fetchColumn();
-}
+// ----- Helper: safe table names for some relations (adjust if your DB differs) -----
+$cityTable = 'citys';               // from your City model
+$industryTable = 'industrys';       // from your Industry model
+$practiceAreaTable = 'practice_areas'; // assumed; adjust if different
+$specialityTable = 'specialities';  // assumed; adjust if different
+$boostsTable = 'boosts';
+$usersTable = 'users';
 
-/**
- * Score like your controller:
- * - 100 if whole search string appears in any combined field text
- * - else 100 if ALL words (>=2) appear across combined fields
- * - else 50 * (#foundWords / #totalWords)
- * - else 0
- */
-function score_like_controller(array $row, array $fields, string $search): int {
-    $search = strtolower(trim($search));
-    if ($search === '') return 0;
-
-    $words = preg_split('/\s+/', $search);
-    $combined = '';
-
-    foreach ($fields as $f) {
-        if (!array_key_exists($f, $row)) continue;
-        $v = $row[$f];
-        if ($v === null) continue;
-        $combined .= ' ' . strtolower((string)$v);
+// ----- Accuracy scoring function that mirrors controller.calculateMatchScore -----
+function calculateMatchScoreCombined(array $item, array $fields, string $searchValue): int {
+    $searchValue = strtolower(trim($searchValue));
+    $searchWords = preg_split('/\s+/', $searchValue, -1, PREG_SPLIT_NO_EMPTY);
+    $combinedValue = '';
+    foreach ($fields as $field) {
+        // field may be dot notation like ownerInfo.first_name
+        $value = $item;
+        foreach (explode('.', $field) as $k) {
+            if (is_array($value) && array_key_exists($k, $value)) {
+                $value = $value[$k];
+            } else {
+                $value = null;
+                break;
+            }
+        }
+        if ($value !== null && $value !== '') {
+            $combinedValue .= ' ' . strtolower((string)$value);
+        }
     }
-    $combined = trim($combined);
+    $combinedValue = trim($combinedValue);
+    if ($combinedValue === '') return 0;
 
-    if ($combined === '') return 0;
-
-    // full-string match
-    if (strpos($combined, $search) !== false) return 100;
-
-    // word-based
-    $totalWords = count($words);
-    $found = 0;
-    foreach ($words as $w) {
-        if ($w === '') continue;
-        if (strpos($combined, $w) !== false) $found++;
+    if (strpos($combinedValue, $searchValue) !== false) {
+        return 100;
     }
 
-    if ($totalWords > 1 && $found === $totalWords) return 100;
-    if ($found > 0 && $totalWords > 0) return (int) floor(50 * ($found / $totalWords));
-
+    $foundWords = 0;
+    foreach ($searchWords as $word) {
+        if ($word !== '' && strpos($combinedValue, $word) !== false) {
+            $foundWords++;
+        }
+    }
+    $totalWords = max(1, count($searchWords));
+    if ($foundWords === $totalWords && $totalWords > 1) {
+        return 100;
+    }
+    if ($foundWords > 0) {
+        return intval(50 * ($foundWords / $totalWords));
+    }
     return 0;
 }
 
-/**
- * Slice per page
- */
-function paginate_array(array $items, int $page, int $perPage): array {
-    $offset = max(0, ($page - 1) * $perPage);
-    return array_slice($items, $offset, $perPage);
+// ----- Helper: fetch user row by id and attach ownerInfo.usercity if possible -----
+function attachUserRelations(PDO $conn, array $row, $userIdField = 'owner', $usersTable = 'users', $cityTable = 'citys') {
+    if (empty($row[$userIdField])) {
+        $row['ownerInfo'] = null;
+        return $row;
+    }
+    $ownerId = $row[$userIdField];
+    // fetch user basic
+    $stmt = $conn->prepare("SELECT id, first_name, last_name, email, city FROM {$usersTable} WHERE id = ? LIMIT 1");
+    $stmt->execute([$ownerId]);
+    $owner = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$owner) {
+        $row['ownerInfo'] = null;
+        return $row;
+    }
+    // attach city if present
+    if (!empty($owner['city'])) {
+        $stmt = $conn->prepare("SELECT id, name FROM {$cityTable} WHERE id = ? LIMIT 1");
+        try {
+            $stmt->execute([$owner['city']]);
+            $city = $stmt->fetch(PDO::FETCH_ASSOC);
+        } catch (PDOException $e) {
+            $city = null;
+        }
+        $owner['usercity'] = $city ?: null;
+    } else {
+        $owner['usercity'] = null;
+    }
+    $row['ownerInfo'] = $owner;
+
+    // attach boosts for user (if any). Controller sometimes expects boost at post-level for owner -> so attach any boost records for user
+    $bstmt = $conn->prepare("SELECT id, user_id, keywords FROM {$GLOBALS['boostsTable']} WHERE user_id = ? LIMIT 1");
+    try {
+        $bstmt->execute([$ownerId]);
+        $boost = $bstmt->fetch(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        $boost = null;
+    }
+    $row['boost'] = $boost ?: null;
+
+    return $row;
 }
 
-// ---------- Inputs ----------
-$all_per_page       = isset($_POST['all_par_page']) ? (int)$_POST['all_par_page'] : 25;
-$post_per_page      = isset($_POST['post_par_page']) ? (int)$_POST['post_par_page'] : 9;
-$people_per_page    = isset($_POST['people_par_page']) ? (int)$_POST['people_par_page'] : 9;
-$referrals_per_page = isset($_POST['referrals_par_page']) ? (int)$_POST['referrals_par_page'] : 9;
-$jobs_per_page      = isset($_POST['job_par_page']) ? (int)$_POST['job_par_page'] : 9;
-$deals_per_page     = isset($_POST['deal_par_page']) ? (int)$_POST['deal_par_page'] : 9;
-
-$posts_page      = isset($_POST['posts_page']) ? (int)$_POST['posts_page'] : 1;
-$peoples_page    = isset($_POST['peoples_page']) ? (int)$_POST['peoples_page'] : 1;
-$referrals_page  = isset($_POST['referrals_page']) ? (int)$_POST['referrals_page'] : 1;
-$jobs_page       = isset($_POST['jobs_page']) ? (int)$_POST['jobs_page'] : 1;
-$deals_page      = isset($_POST['deals_page']) ? (int)$_POST['deals_page'] : 1;
-$merged_page     = isset($_POST['page']) ? (int)$_POST['page'] : 1;
-
-$searchValue = isset($_POST['search_value']) ? strtolower(trim((string)$_POST['search_value'])) : '';
-$hasSearch   = $searchValue !== '';
-
-// ---------- Optional resources ----------
-$hasBoosts = table_exists($conn, 'boosts') && column_exists($conn, 'boosts', 'keywords') &&
-             column_exists($conn, 'boosts', 'product_id') && column_exists($conn, 'boosts', 'model');
-
-// Some tables may not have soft deletes—check each
-$feeds_has_deleted     = column_exists($conn, 'feeds', 'deleted_at');
-$users_has_deleted     = column_exists($conn, 'users', 'deleted_at');
-$jobs_has_deleted      = table_exists($conn, 'eq_jobs') && column_exists($conn, 'eq_jobs', 'deleted_at');
-$deals_has_deleted     = column_exists($conn, 'deals', 'deleted_at');
-
-// ---------- 1) POSTS (feeds) ----------
-$feeds = [];
-if (table_exists($conn, 'feeds')) {
-    $select = "SELECT f.*";
-    if ($hasBoosts) {
-        $select .= ", (SELECT b.keywords FROM boosts b WHERE b.product_id = f.id AND b.model = 'Feed' LIMIT 1) AS boost_keywords";
+// ----- Helper: attach morph boost for a product (Feed/EQJobs) if exists -----
+// Try to find a boost where product_id = item id and model = 'Feed' or 'EQJobs' OR where type like 'Job' etc.
+// This mimics Eloquent morphOne(...)->where('type','Job') style but is permissive.
+function attachProductBoost(PDO $conn, array $row, $modelName, $productField = 'id') {
+    $id = $row[$productField] ?? null;
+    if (empty($id)) {
+        $row['boost'] = null;
+        return $row;
     }
-    $sql = "$select FROM feeds f WHERE 1=1";
-    if ($feeds_has_deleted) $sql .= " AND f.deleted_at IS NULL";
-
-    $params = [];
-    if ($hasSearch) {
-        $sql .= " AND (LOWER(f.title) LIKE :s_feeds
-                    OR LOWER(f.descriptions) LIKE :s_feeds
-                    OR LOWER(f.tags) LIKE :s_feeds
-                    OR LOWER(f.photos) LIKE :s_feeds";
-        if ($hasBoosts) {
-            $sql .= " OR EXISTS (
-                        SELECT 1 FROM boosts b
-                        WHERE b.product_id = f.id
-                          AND b.model = 'Feed'
-                          AND LOWER(b.keywords) LIKE :s_feeds
-                      )";
-        }
-        $sql .= ")";
-        $params[':s_feeds'] = "%{$searchValue}%";
-    }
-
+    $sql = "SELECT id, product_id, model, keywords, type, user_id, start_date, end_date, status FROM {$GLOBALS['boostsTable']} 
+            WHERE product_id = ? AND LOWER(model) = ? LIMIT 1";
     $stmt = $conn->prepare($sql);
+    try {
+        $stmt->execute([$id, strtolower($modelName)]);
+        $b = $stmt->fetch(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        $b = false;
+    }
+    $row['boost'] = $b ?: null;
+    return $row;
+}
+
+// ----- Generic fetch & attach function for a SELECT SQL (no LIMIT) -----
+// $columnsFields: array of search fields names used for scoring (dot notation allowed)
+function fetchAndAttach(PDO $conn, string $selectSql, array $params, array $attachInstructions, array $searchFields, string $searchValue, bool $hasSearch) {
+    // execute main select
+    $stmt = $conn->prepare($selectSql);
     $stmt->execute($params);
-    $feeds = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // scoring fields similar to your controller list for posts
-    $postScoreFields = ['title', 'descriptions', 'tags', 'photos'];
-    if ($hasBoosts) $postScoreFields[] = 'boost_keywords';
+    // attach relations based on $attachInstructions
+    foreach ($rows as &$r) {
+        // ownerInfo by default
+        if (!empty($attachInstructions['owner']) && isset($r[$attachInstructions['owner']])) {
+            $r = attachUserRelations($conn, $r, $attachInstructions['owner'], $GLOBALS['usersTable'], $GLOBALS['cityTable']);
+        } elseif (!empty($attachInstructions['owner_none'])) {
+            // no owner column; skip
+        } else {
+            // ensure consistent shape
+            $r['ownerInfo'] = null;
+        }
 
-    foreach ($feeds as &$r) {
-        $r['accuracy_score'] = $hasSearch ? score_like_controller($r, $postScoreFields, $searchValue) : 0;
-        $r['type'] = 'post';
+        // If need to attach product-level boost (for feed/job)
+        if (!empty($attachInstructions['product_boost_model'])) {
+            $r = attachProductBoost($conn, $r, $attachInstructions['product_boost_model'], $attachInstructions['product_id_field'] ?? 'id');
+        }
+
+        // attach other relations: city (for eq_jobs job_city), industry (by id), referred (user), practicearea, speciality
+        if (!empty($attachInstructions['job_city_field']) && !empty($r[$attachInstructions['job_city_field']])) {
+            $jc = $r[$attachInstructions['job_city_field']];
+            $s = $conn->prepare("SELECT id, name FROM {$GLOBALS['cityTable']} WHERE id = ? LIMIT 1");
+            try { $s->execute([$jc]); $r['city'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $r['city'] = null; }
+        }
+
+        if (!empty($attachInstructions['industry_field']) && !empty($r[$attachInstructions['industry_field']])) {
+            $ind = $r[$attachInstructions['industry_field']];
+            $s = $conn->prepare("SELECT id, title FROM {$GLOBALS['industryTable']} WHERE id = ? LIMIT 1");
+            try { $s->execute([$ind]); $r['industryInfo'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $r['industryInfo'] = null; }
+        }
+
+        if (!empty($attachInstructions['referred_field']) && !empty($r[$attachInstructions['referred_field']])) {
+            $refId = $r[$attachInstructions['referred_field']];
+            $s = $conn->prepare("SELECT id, first_name, last_name, email FROM {$GLOBALS['usersTable']} WHERE id = ? LIMIT 1");
+            try { $s->execute([$refId]); $r['referred'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $r['referred'] = null; }
+        }
+
+        if (!empty($attachInstructions['practicearea_field']) && !empty($r[$attachInstructions['practicearea_field']])) {
+            $pa = $r[$attachInstructions['practicearea_field']];
+            $s = $conn->prepare("SELECT id, title FROM {$GLOBALS['practiceAreaTable']} WHERE id = ? LIMIT 1");
+            try { $s->execute([$pa]); $r['practicearea'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $r['practicearea'] = null; }
+        }
+
+        if (!empty($attachInstructions['speciality_field']) && !empty($r[$attachInstructions['speciality_field']])) {
+            $sp = $r[$attachInstructions['speciality_field']];
+            $s = $conn->prepare("SELECT id, title FROM {$GLOBALS['specialityTable']} WHERE id = ? LIMIT 1");
+            try { $s->execute([$sp]); $r['specialityinfo'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $r['specialityinfo'] = null; }
+        }
+
+        // attach ownerInfo.usercity already handled by attachUserRelations above
     }
     unset($r);
 
-    if ($hasSearch) {
-        $feeds = array_values(array_filter($feeds, fn($x) => ($x['accuracy_score'] ?? 0) > 0));
-        usort($feeds, fn($a,$b) => ($b['accuracy_score'] <=> $a['accuracy_score']));
-    } else {
-        // created_at desc if exists, else id desc
-        if (!empty($feeds) && array_key_exists('created_at', $feeds[0])) {
-            usort($feeds, fn($a,$b) => strtotime($b['created_at'] ?? '1970-01-01') <=> strtotime($a['created_at'] ?? '1970-01-01'));
-        } else {
-            usort($feeds, fn($a,$b) => ($b['id'] ?? 0) <=> ($a['id'] ?? 0));
-        }
+    // compute accuracy score for each row
+    foreach ($rows as &$r2) {
+        $r2['accuracy_score'] = $hasSearch ? calculateMatchScoreCombined($r2, $searchFields, $searchValue) : 0;
     }
+    unset($r2);
+
+    return $rows;
 }
-$feeds_total = count($feeds);
-$feeds_page_items = paginate_array($feeds, $posts_page, $post_per_page);
 
-// ---------- 2) PEOPLES (users role_id=3) ----------
-$peoples = [];
-if (table_exists($conn, 'users') && column_exists($conn, 'users', 'role_id')) {
-    $select = "SELECT u.*";
-    if ($hasBoosts) {
-        $select .= ", (SELECT b.keywords FROM boosts b WHERE b.product_id = u.id AND b.model = 'User' LIMIT 1) AS boost_keywords";
-    }
-    $sql = "$select FROM users u WHERE u.role_id = 3";
-    if ($users_has_deleted) $sql .= " AND u.deleted_at IS NULL";
-    $params = [];
-
+// ----- Section: POSTS (feeds) -----
+// SELECT feeds (controller used Feed::with(['ownerInfo','ownerInfo.usercity','boost']))
+try {
+    $postsSql = "SELECT id, title, descriptions, tags, photos, owner, created_at FROM feeds WHERE deleted_at IS NULL";
+    $postsParams = [];
     if ($hasSearch) {
-        $sql .= " AND (LOWER(u.law_firm) LIKE :s_users
-                    OR LOWER(u.first_name) LIKE :s_users
-                    OR LOWER(u.last_name) LIKE :s_users";
-        if ($hasBoosts) {
-            $sql .= " OR EXISTS (
-                        SELECT 1 FROM boosts b
-                        WHERE b.product_id = u.id
-                          AND b.model = 'User'
-                          AND LOWER(b.keywords) LIKE :s_users
-                      )";
-        }
-        $sql .= ")";
-        $params[':s_users'] = "%{$searchValue}%";
+        $postsSql .= " AND (
+            LOWER(title) LIKE :search OR
+            LOWER(descriptions) LIKE :search OR
+            LOWER(tags) LIKE :search OR
+            LOWER(photos) LIKE :search
+        )";
+        $postsParams[':search'] = "%{$searchValue}%";
     }
+    $posts = fetchAndAttach($conn, $postsSql, $postsParams, [
+        'owner' => 'owner',
+        'product_boost_model' => 'Feed', // also attach product-level boost if present (morph)
+        'product_id_field' => 'id'
+    ], [
+        'title','descriptions','tags','photos','ownerInfo.first_name','ownerInfo.last_name','ownerInfo.usercity.name'
+    ], $searchValue, $hasSearch);
 
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
-    $peoples = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    $peopleScoreFields = ['first_name', 'last_name', 'law_firm', 'image', 'address', 'intro', 'bio'];
-    if ($hasBoosts) $peopleScoreFields[] = 'boost_keywords';
-
-    foreach ($peoples as &$r) {
-        $r['accuracy_score'] = $hasSearch ? score_like_controller($r, $peopleScoreFields, $searchValue) : 0;
-        $r['type'] = 'person';
-    }
-    unset($r);
-
+    // filter & sort
     if ($hasSearch) {
-        $peoples = array_values(array_filter($peoples, fn($x) => ($x['accuracy_score'] ?? 0) > 0));
-        usort($peoples, fn($a,$b) => ($b['accuracy_score'] <=> $a['accuracy_score']));
+        $posts = array_filter($posts, fn($p) => ($p['accuracy_score'] ?? 0) > 0);
+        usort($posts, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
     } else {
-        if (!empty($peoples) && array_key_exists('created_at', $peoples[0])) {
-            usort($peoples, fn($a,$b) => strtotime($b['created_at'] ?? '1970-01-01') <=> strtotime($a['created_at'] ?? '1970-01-01'));
-        } else {
-            usort($peoples, fn($a,$b) => ($b['id'] ?? 0) <=> ($a['id'] ?? 0));
-        }
-    }
-}
-$peoples_total = count($peoples);
-$peoples_page_items = paginate_array($peoples, $peoples_page, $people_per_page);
-
-// ---------- 3) JOBS (eq_jobs, job_type=regular) ----------
-$jobs = [];
-if (table_exists($conn, 'eq_jobs')) {
-    $select = "SELECT j.*";
-    if ($hasBoosts) {
-        $select .= ", (SELECT b.keywords FROM boosts b WHERE b.product_id = j.id AND b.model = 'EQJobs' LIMIT 1) AS boost_keywords";
-    }
-    $sql = "$select FROM eq_jobs j WHERE j.job_type = 'regular'";
-    if ($jobs_has_deleted) $sql .= " AND j.deleted_at IS NULL";
-    $params = [];
-
-    if ($hasSearch) {
-        // In your controller, most job fields in WHERE are commented out; you kept title + boost.
-        $sql .= " AND (LOWER(j.title) LIKE :s_jobs";
-        if ($hasBoosts) {
-            $sql .= " OR EXISTS (
-                        SELECT 1 FROM boosts b
-                        WHERE b.product_id = j.id
-                          AND b.model = 'EQJobs'
-                          AND LOWER(b.keywords) LIKE :s_jobs
-                      )";
-        }
-        $sql .= ")";
-        $params[':s_jobs'] = "%{$searchValue}%";
+        usort($posts, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
 
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
-    $jobs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    // paginate
+    $total_posts = count($posts);
+    $posts_offset = ($pages['posts_page'] - 1) * $post_par_page;
+    $posts_slice = array_slice($posts, $posts_offset, $post_par_page);
 
-    $jobScoreFields = [
-        'title','descriptions','notes','firm','position','representative',
-        'job_city','job_state'
+    $posts_response = [
+        "total_results" => $total_posts,
+        "per_page" => $post_par_page,
+        "current_page" => $pages['posts_page'],
+        "last_page" => (int)ceil($total_posts / max(1, $post_par_page)),
+        "from" => $total_posts > 0 ? $posts_offset + 1 : null,
+        "to" => $posts_offset + count($posts_slice),
+        "data" => array_values($posts_slice)
     ];
-    if ($hasBoosts) $jobScoreFields[] = 'boost_keywords';
-
-    foreach ($jobs as &$r) {
-        $r['accuracy_score'] = $hasSearch ? score_like_controller($r, $jobScoreFields, $searchValue) : 0;
-        $r['type'] = 'job';
-    }
-    unset($r);
-
-    if ($hasSearch) {
-        $jobs = array_values(array_filter($jobs, fn($x) => ($x['accuracy_score'] ?? 0) > 0));
-        usort($jobs, fn($a,$b) => ($b['accuracy_score'] <=> $a['accuracy_score']));
-    } else {
-        if (!empty($jobs) && array_key_exists('created_at', $jobs[0])) {
-            usort($jobs, fn($a,$b) => strtotime($b['created_at'] ?? '1970-01-01') <=> strtotime($a['created_at'] ?? '1970-01-01'));
-        } else {
-            usort($jobs, fn($a,$b) => ($b['id'] ?? 0) <=> ($a['id'] ?? 0));
-        }
-    }
+} catch (Exception $e) {
+    echo json_encode(["status"=>false, "message"=>"Posts fetch error: ".$e->getMessage()]);
+    exit();
 }
-$jobs_total = count($jobs);
-$jobs_page_items = paginate_array($jobs, $jobs_page, $jobs_per_page);
 
-// ---------- 4) REFERRALS (eq_jobs, job_type=referral) ----------
-$referrals = [];
-if (table_exists($conn, 'eq_jobs')) {
-    $select = "SELECT j.*";
-    if ($hasBoosts) {
-        $select .= ", (SELECT b.keywords FROM boosts b WHERE b.product_id = j.id AND b.model = 'EQJobs' LIMIT 1) AS boost_keywords";
+// ----- Section: PEOPLES (users role_id = 3) -----
+try {
+    $peoplesSql = "SELECT id, first_name, last_name, email, city, law_firm, image, address, intro, bio, created_at
+                   FROM users WHERE deleted_at IS NULL AND role_id = 3";
+    $peoplesParams = [];
+    if ($hasSearch) {
+        $peoplesSql .= " AND (
+            LOWER(law_firm) LIKE :ps OR LOWER(first_name) LIKE :ps OR LOWER(last_name) LIKE :ps
+        )";
+        $peoplesParams[':ps'] = "%{$searchValue}%";
     }
-    // Optional: get referred user's name if you store user id in `referred_by`
-    $hasUsers = table_exists($conn, 'users') && column_exists($conn, 'users', 'first_name') && column_exists($conn, 'users', 'last_name');
-    if ($hasUsers && column_exists($conn, 'eq_jobs', 'referred_by')) {
-        $select .= ",
-            (SELECT u.first_name FROM users u WHERE u.id = j.referred_by LIMIT 1) AS referred_first_name,
-            (SELECT u.last_name  FROM users u WHERE u.id = j.referred_by LIMIT 1) AS referred_last_name";
-    }
+    $peoplesRaw = fetchAndAttach($conn, $peoplesSql, $peoplesParams, [
+        // owner not used here; but attach usercity via attachUserRelations expects 'owner' key; we'll handle differently
+        'owner_none' => true
+    ], [
+        'first_name','last_name','law_firm','image','address','intro','bio','usercity.name','industryinfo.title','boost.keywords'
+    ], $searchValue, $hasSearch);
 
-    $sql = "$select FROM eq_jobs j WHERE j.job_type = 'referral'";
-    if ($jobs_has_deleted) $sql .= " AND j.deleted_at IS NULL";
-    $params = [];
+    // attach usercity / boost / industryinfo for each person properly (since fetchAndAttach didn't for users)
+    foreach ($peoplesRaw as &$p) {
+        // attach usercity (users.city -> citys)
+        if (!empty($p['city'])) {
+            $s = $conn->prepare("SELECT id, name FROM {$cityTable} WHERE id = ? LIMIT 1");
+            try { $s->execute([$p['city']]); $p['usercity'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $p['usercity'] = null; }
+        } else {
+            $p['usercity'] = null;
+        }
+        // boost for user
+        $b = $conn->prepare("SELECT id, user_id, keywords FROM {$boostsTable} WHERE user_id = ? LIMIT 1");
+        try { $b->execute([$p['id']]); $p['boost'] = $b->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $p['boost'] = null; }
+
+        // industryinfo if industry column exists
+        if (isset($p['industry']) && $p['industry']) {
+            $s = $conn->prepare("SELECT id, title FROM {$industryTable} WHERE id = ? LIMIT 1");
+            try { $s->execute([$p['industry']]); $p['industryinfo'] = $s->fetch(PDO::FETCH_ASSOC) ?: null; } catch (PDOException $e) { $p['industryinfo'] = null; }
+        } else {
+            $p['industryinfo'] = null;
+        }
+        // compute accuracy
+        $p['accuracy_score'] = $hasSearch ? calculateMatchScoreCombined($p, [
+            'first_name','last_name','law_firm','image','address','intro','bio','usercity.name','industryinfo.title','boost.keywords'
+        ], $searchValue) : 0;
+    }
+    unset($p);
 
     if ($hasSearch) {
-        $sql .= " AND (LOWER(j.title) LIKE :s_refs
-                    OR LOWER(j.descriptions) LIKE :s_refs";
-        if ($hasBoosts) {
-            $sql .= " OR EXISTS (
-                        SELECT 1 FROM boosts b
-                        WHERE b.product_id = j.id
-                          AND b.model = 'EQJobs'
-                          AND LOWER(b.keywords) LIKE :s_refs
-                      )";
-        }
-        $sql .= ")";
-        $params[':s_refs'] = "%{$searchValue}%";
+        $peoples = array_filter($peoplesRaw, fn($x) => ($x['accuracy_score'] ?? 0) > 0);
+        usort($peoples, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
+    } else {
+        usort($peoplesRaw, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+        $peoples = $peoplesRaw;
     }
 
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
-    $referrals = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $total_peoples = count($peoples);
+    $peoples_offset = ($pages['peoples_page'] - 1) * $people_par_page;
+    $peoples_slice = array_slice($peoples, $peoples_offset, $people_par_page);
 
-    $refScoreFields = [
-        'title','descriptions','notes','firm','position','representative'
+    $peoples_response = [
+        "total_results" => $total_peoples,
+        "per_page" => $people_par_page,
+        "current_page" => $pages['peoples_page'],
+        "last_page" => (int)ceil($total_peoples / max(1, $people_par_page)),
+        "from" => $total_peoples > 0 ? $peoples_offset + 1 : null,
+        "to" => $peoples_offset + count($peoples_slice),
+        "data" => array_values($peoples_slice)
     ];
-    if ($hasUsers && column_exists($conn, 'eq_jobs', 'referred_by')) {
-        $refScoreFields[] = 'referred_first_name';
-        $refScoreFields[] = 'referred_last_name';
-    }
-    if ($hasBoosts) $refScoreFields[] = 'boost_keywords';
-
-    foreach ($referrals as &$r) {
-        $r['accuracy_score'] = $hasSearch ? score_like_controller($r, $refScoreFields, $searchValue) : 0;
-        $r['type'] = 'referral';
-    }
-    unset($r);
-
-    if ($hasSearch) {
-        $referrals = array_values(array_filter($referrals, fn($x) => ($x['accuracy_score'] ?? 0) > 0));
-        usort($referrals, fn($a,$b) => ($b['accuracy_score'] <=> $a['accuracy_score']));
-    } else {
-        if (!empty($referrals) && array_key_exists('created_at', $referrals[0])) {
-            usort($referrals, fn($a,$b) => strtotime($b['created_at'] ?? '1970-01-01') <=> strtotime($a['created_at'] ?? '1970-01-01'));
-        } else {
-            usort($referrals, fn($a,$b) => ($b['id'] ?? 0) <=> ($a['id'] ?? 0));
-        }
-    }
+} catch (Exception $e) {
+    echo json_encode(["status"=>false, "message"=>"Peoples fetch error: ".$e->getMessage()]);
+    exit();
 }
-$referrals_total = count($referrals);
-$referrals_page_items = paginate_array($referrals, $referrals_page, $referrals_per_page);
 
-// ---------- 5) DEALS (deals) ----------
-$deals = [];
-if (table_exists($conn, 'deals')) {
-    $sql = "SELECT d.* FROM deals d WHERE 1=1";
-    if ($deals_has_deleted) $sql .= " AND d.deleted_at IS NULL";
-    $params = [];
-
+// ----- Section: JOBS (eq_jobs job_type = 'regular') -----
+try {
+    // include is_active = 1 to mimic EQJobs global scope
+    $jobsSql = "SELECT id, title, descriptions, notes, firm, position, representative, job_city, job_state, owner, industry, speciality, practice_area, created_at
+                FROM eq_jobs WHERE deleted_at IS NULL AND job_type = 'regular' AND is_active = 1";
+    $jobsParams = [];
     if ($hasSearch) {
-        // Your controller searches title + descriptions + notes + (speciality.title). We include spec title if table/cols exist.
-        $sql .= " AND (LOWER(d.title) LIKE :s_deals
-                    OR LOWER(d.descriptions) LIKE :s_deals
-                    OR LOWER(d.notes) LIKE :s_deals";
-
-        $hasSpecTable = table_exists($conn, 'specialities') && column_exists($conn, 'specialities', 'title') &&
-                        column_exists($conn, 'deals', 'speciality');
-        if ($hasSpecTable) {
-            $sql .= " OR EXISTS (
-                        SELECT 1 FROM specialities s
-                        WHERE s.id = d.speciality
-                          AND LOWER(s.title) LIKE :s_deals
-                    )";
-        }
-        $sql .= ")";
-        $params[':s_deals'] = "%{$searchValue}%";
+        $jobsSql .= " AND (
+            LOWER(title) LIKE :js OR
+            LOWER(descriptions) LIKE :js
+        )";
+        $jobsParams[':js'] = "%{$searchValue}%";
     }
 
-    $stmt = $conn->prepare($sql);
-    $stmt->execute($params);
-    $deals = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $jobs = fetchAndAttach($conn, $jobsSql, $jobsParams, [
+        'owner' => 'owner',
+        'job_city_field' => 'job_city',
+        'industry_field' => 'industry',
+        'practicearea_field' => 'practice_area',
+        'speciality_field' => 'speciality',
+        'product_boost_model' => 'EQJobs', // try to attach product boost by model name
+        'product_id_field' => 'id',
+        'referred_field' => 'referred_by'
+    ], [
+        'title','descriptions','notes','firm','position','representative','city.name','industryInfo.title','ownerInfo.first_name','ownerInfo.last_name','boost.keywords'
+    ], $searchValue, $hasSearch);
 
-    $dealScoreFields = [
-        'title','descriptions','notes','tags','photos','amount',
-        'firm','company_name','status','client','city','state'
+    if ($hasSearch) {
+        $jobs = array_filter($jobs, fn($j) => ($j['accuracy_score'] ?? 0) > 0);
+        usort($jobs, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
+    } else {
+        usort($jobs, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+    }
+
+    $total_jobs = count($jobs);
+    $jobs_offset = ($pages['jobs_page'] - 1) * $job_par_page;
+    $jobs_slice = array_slice($jobs, $jobs_offset, $job_par_page);
+
+    $jobs_response = [
+        "total_results" => $total_jobs,
+        "per_page" => $job_par_page,
+        "current_page" => $pages['jobs_page'],
+        "last_page" => (int)ceil($total_jobs / max(1, $job_par_page)),
+        "from" => $total_jobs > 0 ? $jobs_offset + 1 : null,
+        "to" => $jobs_offset + count($jobs_slice),
+        "data" => array_values($jobs_slice)
     ];
+} catch (Exception $e) {
+    echo json_encode(["status"=>false, "message"=>"Jobs fetch error: ".$e->getMessage()]);
+    exit();
+}
 
-    foreach ($deals as &$r) {
-        $r['accuracy_score'] = $hasSearch ? score_like_controller($r, $dealScoreFields, $searchValue) : 0;
-        $r['type'] = 'deal';
+// ----- Section: REFERRALS (eq_jobs job_type = 'referral') -----
+try {
+    $refSql = "SELECT id, title, descriptions, notes, firm, position, representative, job_city, job_state, owner, industry, speciality, practice_area, referred_by, created_at
+                FROM eq_jobs WHERE deleted_at IS NULL AND job_type = 'referral' AND is_active = 1";
+    $refParams = [];
+    if ($hasSearch) {
+        $refSql .= " AND (
+            LOWER(title) LIKE :rs OR
+            LOWER(descriptions) LIKE :rs
+        )";
+        $refParams[':rs'] = "%{$searchValue}%";
     }
-    unset($r);
+
+    $referrals = fetchAndAttach($conn, $refSql, $refParams, [
+        'owner' => 'owner',
+        'job_city_field' => 'job_city',
+        'industry_field' => 'industry',
+        'practicearea_field' => 'practice_area',
+        'speciality_field' => 'speciality',
+        'referred_field' => 'referred_by',
+        'product_boost_model' => 'EQJobs',
+        'product_id_field' => 'id'
+    ], [
+        'title','descriptions','notes','firm','position','representative','city.name','industryInfo.title','ownerInfo.first_name','ownerInfo.last_name','referred.first_name','referred.last_name','boost.keywords'
+    ], $searchValue, $hasSearch);
 
     if ($hasSearch) {
-        $deals = array_values(array_filter($deals, fn($x) => ($x['accuracy_score'] ?? 0) > 0));
-        usort($deals, fn($a,$b) => ($b['accuracy_score'] <=> $a['accuracy_score']));
+        $referrals = array_filter($referrals, fn($r) => ($r['accuracy_score'] ?? 0) > 0);
+        usort($referrals, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
     } else {
-        if (!empty($deals) && array_key_exists('created_at', $deals[0])) {
-            usort($deals, fn($a,$b) => strtotime($b['created_at'] ?? '1970-01-01') <=> strtotime($a['created_at'] ?? '1970-01-01'));
-        } else {
-            usort($deals, fn($a,$b) => ($b['id'] ?? 0) <=> ($a['id'] ?? 0));
-        }
+        usort($referrals, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
+
+    $total_ref = count($referrals);
+    $ref_offset = ($pages['referrals_page'] - 1) * $referrals_par_page;
+    $ref_slice = array_slice($referrals, $ref_offset, $referrals_par_page);
+
+    $referrals_response = [
+        "total_results" => $total_ref,
+        "per_page" => $referrals_par_page,
+        "current_page" => $pages['referrals_page'],
+        "last_page" => (int)ceil($total_ref / max(1, $referrals_par_page)),
+        "from" => $total_ref > 0 ? $ref_offset + 1 : null,
+        "to" => $ref_offset + count($ref_slice),
+        "data" => array_values($ref_slice)
+    ];
+} catch (Exception $e) {
+    echo json_encode(["status"=>false, "message"=>"Referrals fetch error: ".$e->getMessage()]);
+    exit();
 }
-$deals_total = count($deals);
-$deals_page_items = paginate_array($deals, $deals_page, $deals_per_page);
 
-// ---------- MERGED (top 5 of each, then created_at desc) ----------
-$merged_take = 5;
-$merged = array_merge(
-    array_map(function($x){ $x['type'] = 'post';     return $x; }, array_slice($feeds,     0, $merged_take)),
-    array_map(function($x){ $x['type'] = 'person';   return $x; }, array_slice($peoples,   0, $merged_take)),
-    array_map(function($x){ $x['type'] = 'referral'; return $x; }, array_slice($referrals, 0, $merged_take)),
-    array_map(function($x){ $x['type'] = 'job';      return $x; }, array_slice($jobs,      0, $merged_take)),
-    array_map(function($x){ $x['type'] = 'deal';     return $x; }, array_slice($deals,     0, $merged_take))
-);
-// Sort merged by created_at desc (fallback id desc)
-usort($merged, function($a,$b){
-    $a_ts = isset($a['created_at']) ? strtotime($a['created_at']) : 0;
-    $b_ts = isset($b['created_at']) ? strtotime($b['created_at']) : 0;
-    if ($a_ts !== $b_ts) return $b_ts <=> $a_ts;
-    return ($b['id'] ?? 0) <=> ($a['id'] ?? 0);
-});
-$merged_total = count($merged);
-$merged_page_items = paginate_array($merged, $merged_page, $all_per_page);
+// ----- Section: DEALS -----
+try {
+    $dealSql = "SELECT id, title, descriptions, notes, press_release_link, tags, photos, amount, owner, firm, posted_date, other_attorneys, client, industry, company_name, state, city, practice_area, speciality, status, created_at
+                FROM deals WHERE deleted_at IS NULL";
+    $dealParams = [];
+    if ($hasSearch) {
+        $dealSql .= " AND (
+            LOWER(title) LIKE :ds OR
+            LOWER(descriptions) LIKE :ds OR
+            LOWER(notes) LIKE :ds
+        )";
+        $dealParams[':ds'] = "%{$searchValue}%";
+    }
 
-// ---------- Response ----------
-$total_number_of_result = $feeds_total + $peoples_total + $referrals_total + $jobs_total + $deals_total;
+    $deals = fetchAndAttach($conn, $dealSql, $dealParams, [
+        'owner' => 'owner',
+        'industry_field' => 'industry',
+        'practicearea_field' => 'practice_area',
+        'speciality_field' => 'speciality',
+        'product_boost_model' => null // controller didn't include boost for deals
+    ], [
+        'title','descriptions','notes','tags','photos','amount','firm','company_name','status','ownerInfo.first_name','ownerInfo.last_name','practicearea.title','specialityinfo.title','industryinfo.title'
+    ], $searchValue, $hasSearch);
 
+    if ($hasSearch) {
+        $deals = array_filter($deals, fn($d) => ($d['accuracy_score'] ?? 0) > 0);
+        usort($deals, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
+    } else {
+        usort($deals, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+    }
+
+    $total_deals = count($deals);
+    $deal_offset = ($pages['deals_page'] - 1) * $deal_par_page;
+    $deal_slice = array_slice($deals, $deal_offset, $deal_par_page);
+
+    $deals_response = [
+        "total_results" => $total_deals,
+        "per_page" => $deal_par_page,
+        "current_page" => $pages['deals_page'],
+        "last_page" => (int)ceil($total_deals / max(1, $deal_par_page)),
+        "from" => $total_deals > 0 ? $deal_offset + 1 : null,
+        "to" => $deal_offset + count($deal_slice),
+        "data" => array_values($deal_slice)
+    ];
+} catch (Exception $e) {
+    echo json_encode(["status"=>false, "message"=>"Deals fetch error: ".$e->getMessage()]);
+    exit();
+}
+
+// ----- MERGED PAGINATION (take top 5 from each, then merge & paginate) -----
+try {
+    // Take up to first 5 entries of each collection (sorted already)
+    $mergedData = [];
+    $appendWithType = function($arr, $type) use (&$mergedData) {
+        $take = array_slice($arr, 0, 5);
+        foreach ($take as $item) {
+            // preserve object as array; add type
+            $item['type'] = $type;
+            $mergedData[] = $item;
+        }
+    };
+
+    appendWithType($posts, 'post');
+    appendWithType($peoples, 'person');
+    appendWithType($referrals, 'referral');
+    appendWithType($jobs, 'job');
+    appendWithType($deals, 'deal');
+
+    // sort merged by created_at desc (if exists)
+    usort($mergedData, function($a, $b) {
+        $aTime = strtotime($a['created_at'] ?? '1970-01-01');
+        $bTime = strtotime($b['created_at'] ?? '1970-01-01');
+        return $bTime <=> $aTime;
+    });
+
+    $merged_total = count($mergedData);
+    $merged_page = max(1, (int)($_POST['page'] ?? 1));
+    $merged_offset = ($merged_page - 1) * max(1, $perPage);
+    $merged_slice = array_slice($mergedData, $merged_offset, max(1, $perPage));
+
+    $merged_response = [
+        "total_results" => $merged_total,
+        "per_page" => $perPage,
+        "current_page" => $merged_page,
+        "last_page" => (int)ceil($merged_total / max(1, $perPage)),
+        "from" => $merged_total > 0 ? $merged_offset + 1 : null,
+        "to" => $merged_offset + count($merged_slice),
+        "data" => array_values($merged_slice)
+    ];
+} catch (Exception $e) {
+    echo json_encode(["status"=>false, "message"=>"Merged fetch error: ".$e->getMessage()]);
+    exit();
+}
+
+// ----- Final response structure (mirrors the controller flow) -----
 $response = [
-    'status' => true,
-
-    // keep order: posts, peoples, referrals, jobs, deals (plus merged)
-    'posts' => [
-        'page' => $posts_page,
-        'per_page' => $post_per_page,
-        'total' => $feeds_total,
-        'data' => array_values($feeds_page_items),
-    ],
-    'peoples' => [
-        'page' => $peoples_page,
-        'per_page' => $people_per_page,
-        'total' => $peoples_total,
-        'data' => array_values($peoples_page_items),
-    ],
-    'referrals' => [
-        'page' => $referrals_page,
-        'per_page' => $referrals_per_page,
-        'total' => $referrals_total,
-        'data' => array_values($referrals_page_items),
-    ],
-    'jobs' => [
-        'page' => $jobs_page,
-        'per_page' => $jobs_per_page,
-        'total' => $jobs_total,
-        'data' => array_values($jobs_page_items),
-    ],
-    'deals' => [
-        'page' => $deals_page,
-        'per_page' => $deals_per_page,
-        'total' => $deals_total,
-        'data' => array_values($deals_page_items),
-    ],
-
-    // merged top section (optional but useful to mirror your view)
-    'merged' => [
-        'page' => $merged_page,
-        'per_page' => $all_per_page,
-        'total' => $merged_total,
-        'data' => array_values($merged_page_items),
-    ],
-
-    'total_number_of_result' => $total_number_of_result . ' RESULTS',
-    'search_value' => $searchValue,
+    "status" => true,
+    "searchValue" => $searchValue,
+    "merged" => $merged_response,
+    "posts" => $posts_response,
+    "peoples" => $peoples_response,
+    "referrals" => $referrals_response,
+    "jobs" => $jobs_response,
+    "deals" => $deals_response,
+    // total number of results across categories (controller used this string)
+    "total_number_of_result" => (
+        ($posts_response['total_results'] ?? 0) +
+        ($peoples_response['total_results'] ?? 0) +
+        ($referrals_response['total_results'] ?? 0) +
+        ($jobs_response['total_results'] ?? 0) +
+        ($deals_response['total_results'] ?? 0)
+    ) . " RESULTS",
 ];
 
-echo json_encode($response);
+// Output JSON
+echo json_encode($response, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
