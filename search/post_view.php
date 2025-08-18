@@ -23,18 +23,22 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 // ===== Input =====
 $searchValue   = isset($_POST['search']) ? trim($_POST['search']) : '';
-$posts_page    = isset($_POST['posts_page']) ? (int)$_POST['posts_page'] : 1;
-$post_per_page = isset($_POST['post_per_page']) ? (int)$_POST['post_per_page'] : 10;
+$current_page  = isset($_POST['current_page']) ? (int)$_POST['current_page'] : 1;
+$per_page      = isset($_POST['per_page']) ? (int)$_POST['per_page'] : 10;
 $hasSearch     = !empty($searchValue);
 
+// Make sure safe values
+$current_page = max(1, $current_page);
+$per_page     = max(1, $per_page);
+
 try {
-    // ===== Fetch Only Needed Feed Columns =====
+    // ===== Base Query =====
     $sql = "SELECT id, title, descriptions, tags, photos, owner, created_at 
             FROM feeds 
             WHERE deleted_at IS NULL";
     $params = [];
 
-    // ===== Search Condition (exact same as controller) =====
+    // ===== Search Filter =====
     if ($hasSearch) {
         $sql .= " AND (
             LOWER(title) LIKE :search OR 
@@ -49,41 +53,33 @@ try {
     $stmt->execute($params);
     $posts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // ===== Attach Relations (Controller Style) =====
+    // ===== Relations =====
     foreach ($posts as &$post) {
-        // --- Owner Info ---
         if (!empty($post['owner'])) {
             $ownerStmt = $conn->prepare("SELECT id, first_name, last_name, email, city 
-                                         FROM users 
-                                         WHERE id = ?");
+                                         FROM users WHERE id = ?");
             $ownerStmt->execute([$post['owner']]);
             $post['ownerInfo'] = $ownerStmt->fetch(PDO::FETCH_ASSOC);
 
-            // --- Owner City ---
             if (!empty($post['ownerInfo']['city'])) {
-                $cityStmt = $conn->prepare("SELECT id, name 
-                                            FROM citys 
-                                            WHERE id = ?");
+                $cityStmt = $conn->prepare("SELECT id, name FROM citys WHERE id = ?");
                 $cityStmt->execute([$post['ownerInfo']['city']]);
                 $post['ownerInfo']['usercity'] = $cityStmt->fetch(PDO::FETCH_ASSOC);
             } else {
                 $post['ownerInfo']['usercity'] = null;
             }
 
-            // --- Boosts for this user ---
             $boostStmt = $conn->prepare("SELECT id, user_id, keywords 
-                                         FROM boosts 
-                                         WHERE user_id = ?");
+                                         FROM boosts WHERE user_id = ?");
             $boostStmt->execute([$post['ownerInfo']['id']]);
             $post['boost'] = $boostStmt->fetch(PDO::FETCH_ASSOC);
-
         } else {
             $post['ownerInfo'] = null;
             $post['boost'] = null;
         }
     }
 
-    // ===== Accuracy Score (Controller Rule) =====
+    // ===== Accuracy Score =====
     function calculateMatchScore($post, $fields, $searchValue) {
         $score = 0;
         $searchValue = strtolower($searchValue);
@@ -97,7 +93,7 @@ try {
             if ($value) {
                 $value = strtolower($value);
                 if (strpos($value, $searchValue) !== false) {
-                    $score += 100; // full match
+                    $score += 100;
                     continue;
                 }
                 $foundWords = 0;
@@ -131,7 +127,7 @@ try {
         $post['accuracy_score'] = $hasSearch ? calculateMatchScore($post, $fields, $searchValue) : 0;
     }
 
-    // ===== Sort & Paginate =====
+    // ===== Sorting =====
     if ($hasSearch) {
         $posts = array_filter($posts, fn($p) => $p['accuracy_score'] > 0);
         usort($posts, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
@@ -139,16 +135,26 @@ try {
         usort($posts, fn($a, $b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
 
-    $total_posts = count($posts);
-    $posts = array_slice($posts, ($posts_page - 1) * $post_per_page, $post_per_page);
+    // ===== Pagination =====
+    $total_results = count($posts);
+    $last_page     = (int) ceil($total_results / $per_page);
+    $offset        = ($current_page - 1) * $per_page;
+    $pagedPosts    = array_slice($posts, $offset, $per_page);
+
+    $from = $total_results > 0 ? $offset + 1 : null;
+    $to   = $offset + count($pagedPosts);
 
     // ===== Response =====
     echo json_encode([
-        "status"    => true,
-        "total"     => $total_posts,
-        "page"      => $posts_page,
-        "per_page"  => $post_per_page,
-        "data"      => $posts
+        "status"        => true,
+        "searchValue"   => $searchValue,
+        "total_results" => $total_results,
+        "per_page"      => $per_page,
+        "current_page"  => $current_page,
+        "last_page"     => $last_page,
+        "from"          => $from,
+        "to"            => $to,
+        "data"          => $pagedPosts
     ]);
 
 } catch (Exception $e) {
