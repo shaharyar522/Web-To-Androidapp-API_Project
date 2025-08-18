@@ -473,6 +473,8 @@ try {
 }
 
 // ----- Section: DEALS -----
+$GLOBALS['jobimagepath'] = $protocol . "http://127.0.0.1:8000/profile/";
+
 try {
     $dealSql = "SELECT id, title, descriptions, notes, press_release_link, tags, photos, amount, owner, firm, posted_date, other_attorneys, client, industry, company_name, state, city, practice_area, speciality, status, created_at
                 FROM deals WHERE deleted_at IS NULL";
@@ -502,6 +504,17 @@ try {
     } else {
         usort($deals, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
+
+// ======= ADD GLOBAL IMAGE PATH HERE =======
+foreach ($deals as &$deal) {
+    if (!empty($deal['photos'])) {
+        $deal['photos'] = $GLOBALS['jobimagepath'] . $deal['photos'];
+    } else {
+        $deal['photos'] = $GLOBALS['jobimagepath'] . 'default.jpg'; // optional fallback
+    }
+}
+unset($deal);
+// ==========================================
 
     $total_deals = count($deals);
     $deal_offset = ($pages['deals_page'] - 1) * $deal_par_page;
