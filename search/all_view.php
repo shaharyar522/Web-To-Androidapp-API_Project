@@ -24,20 +24,7 @@ function appendWithType($rows, $type, $limit = 5) {
 header("Content-Type: application/json; charset=utf-8");
 
 // ----- DB connection (edit if needed) -----
-$host = "localhost";
-$db_name = "esqify_db";
-$username = "root";
-$password = "";
-
-try {
-    $conn = new PDO("mysql:host=$host;dbname=$db_name;charset=utf8", $username, $password, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    ]);
-} catch (PDOException $e) {
-    http_response_code(500);
-    echo json_encode(["status" => false, "message" => "Connection failed: " . $e->getMessage()]);
-    exit();
-}
+include('connection.php');
 
 // ----- Only POST -----
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -254,7 +241,7 @@ function fetchAndAttach(PDO $conn, string $selectSql, array $params, array $atta
 try {
     $postsSql = "SELECT id, title, descriptions, tags, photos, owner, created_at FROM feeds WHERE deleted_at IS NULL";
     $postsParams = [];
-    if ($hasSearch) {
+    if ($hasSearch) { 
         $postsSql .= " AND (
             LOWER(title) LIKE :search OR
             LOWER(descriptions) LIKE :search OR
@@ -278,6 +265,32 @@ try {
     } else {
         usort($posts, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
+
+
+// ===== Process photos =====
+foreach ($posts as &$post) {
+    if (!empty($post['photos'])) {
+        $photos = json_decode($post['photos'], true); // decode JSON
+        if (is_array($photos) && count($photos) > 0) {
+            // Ensure each photo file exists, else fallback to default.jpg
+            $photos = array_map(function($p) {
+                $fullPath = __DIR__ . "/profile/" . $p;
+                if(file_exists($fullPath) && !empty($p)) {
+                    return $GLOBALS['jobimagepath'] . $p;
+                } else {
+                    return $GLOBALS['jobimagepath'] . 'default.jpg';
+                }
+            }, $photos);
+        } else {
+            $photos = [$GLOBALS['jobimagepath'] . 'default.jpg'];
+        }
+        $post['photos'] = $photos;
+    } else {
+        $post['photos'] = [$GLOBALS['jobimagepath'] . 'default.jpg'];
+    }
+}
+unset($post);
+
 
     // paginate
     $total_posts = count($posts);
@@ -473,7 +486,7 @@ try {
 }
 
 // ----- Section: DEALS -----
-$GLOBALS['jobimagepath'] = $protocol . "http://127.0.0.1:8000/profile/";
+
 
 try {
     $dealSql = "SELECT id, title, descriptions, notes, press_release_link, tags, photos, amount, owner, firm, posted_date, other_attorneys, client, industry, company_name, state, city, practice_area, speciality, status, created_at

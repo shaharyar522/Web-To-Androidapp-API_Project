@@ -15,11 +15,10 @@ try {
     exit();
 }
 
-// Detect protocol
-$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'
-             || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
 
-$GLOBALS['jobimagepath'] = $protocol . "http://127.0.0.1:8000/profile/";
+// ===== Detect protocol =====
+$protocol = "http://"; // force HTTP for local
+$GLOBALS['jobimagepath'] = $protocol . "127.0.0.1:8000/profile/"; // folder with images
 
 ?>
 
