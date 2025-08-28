@@ -9,7 +9,8 @@
 //   referrals_par_page, referrals_page
 //   job_par_page, jobs_page
 //   deal_par_page, deals_page
-function appendWithType($rows, $type, $limit = 5) {
+
+function appendWithType($rows, $type, $limit = 5){
     $result = [];
     $count = 0;
     foreach ($rows as $row) {
@@ -25,6 +26,34 @@ header("Content-Type: application/json; charset=utf-8");
 
 // ----- DB connection (edit if needed) -----
 include('connection.php');
+// ===== Detect protocol + host dynamically =====
+
+
+/**
+ * Normalize photos field (JSON string, array, string, null)
+ */
+function normalizePhotos($photos) {
+    if (is_array($photos)) {
+        return $photos;
+    }
+    if (is_string($photos) && $photos !== '') {
+        $decoded = json_decode($photos, true);
+        return is_array($decoded) ? $decoded : [$photos]; // fallback: treat as filename
+    }
+    return [];
+}
+
+/**
+ * Convert normalized photos into full URLs (with fallback default)
+ */
+function getPhotoUrls($photos) {
+    $normalized = normalizePhotos($photos);
+    if (!empty($normalized)) {
+        return array_map(fn($p) => $GLOBALS['dealimage'] . ltrim($p, '/'), $normalized);
+    }
+    return [$GLOBALS['defaultimage']];
+}
+
 
 // ----- Only POST -----
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -239,11 +268,8 @@ function fetchAndAttach(PDO $conn, string $selectSql, array $params, array $atta
 // ----- Section: POSTS (feeds) -----
 // SELECT feeds (controller used Feed::with(['ownerInfo','ownerInfo.usercity','boost']))
 try {
-    $postsSql = "SELECT id, title, descriptions, tags, photos, owner, created_at 
-                 FROM feeds 
-                 WHERE deleted_at IS NULL";
+    $postsSql = "SELECT id, title, descriptions, tags, photos, owner, created_at FROM feeds WHERE deleted_at IS NULL";
     $postsParams = [];
-
     if ($hasSearch) { 
         $postsSql .= " AND (
             LOWER(title) LIKE :search OR
@@ -253,25 +279,15 @@ try {
         )";
         $postsParams[':search'] = "%{$searchValue}%";
     }
+    $posts = fetchAndAttach($conn, $postsSql, $postsParams, [
+        'owner' => 'owner',
+        'product_boost_model' => 'Feed', // also attach product-level boost if present (morph)
+        'product_id_field' => 'id'
+    ], [
+        'title','descriptions','tags','photos','ownerInfo.first_name','ownerInfo.last_name','ownerInfo.usercity.name'
+    ], $searchValue, $hasSearch);
 
-    $posts = fetchAndAttach(
-        $conn,
-        $postsSql,
-        $postsParams,
-        [
-            'owner' => 'owner',
-            'product_boost_model' => 'Feed',
-            'product_id_field' => 'id'
-        ],
-        [
-            'title','descriptions','tags','photos',
-            'ownerInfo.first_name','ownerInfo.last_name','ownerInfo.usercity.name'
-        ],
-        $searchValue,
-        $hasSearch
-    );
-
-    // Filter & sort
+    // filter & sort
     if ($hasSearch) {
         $posts = array_filter($posts, fn($p) => ($p['accuracy_score'] ?? 0) > 0);
         usort($posts, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
@@ -279,28 +295,35 @@ try {
         usort($posts, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
 
-    // ✅ Fix photos
+
     foreach ($posts as &$post) {
-        $photos = normalizePhotos($post['photos']);
+    if (!empty($post['photos'])) {
+        $photos = json_decode($post['photos'], true);
 
-        // Map into URLs
-        $photos = array_map(function($p) {
-            $fullPath = $GLOBALS['jobimagefolder'] . $p;
-            return (!empty($p) && file_exists($fullPath))
-                ? $GLOBALS['jobimagepath'] . $p
-                : $GLOBALS['defaultimage'];
-        }, $photos);
+        if (is_array($photos) && count($photos) > 0) {
+            $photos = array_map(function($p) {
+                $fullPath = $GLOBALS['dealimage'] . $p; // absolute path
 
-        // Ensure at least one default
-        if (empty($photos)) {
-            $photos = [$GLOBALS['defaultimage']];
+                if (!empty($p) && file_exists($fullPath)) {
+                    return $GLOBALS['dealimage'] . $p; // URL
+                } else {
+                    return $GLOBALS['dealimage'] . 'default.jpg'; // fallback
+                }
+            }, $photos);
+        } else {
+            $photos = [$GLOBALS['dealimage'] . 'default.jpg'];
         }
 
         $post['photos'] = $photos;
+    } else {
+        $post['photos'] = [$GLOBALS['dealimage'] . 'default.jpg'];
     }
-    unset($post);
+}
+unset($post);
 
-    // Paginate
+
+
+    // paginate
     $total_posts = count($posts);
     $posts_offset = ($pages['posts_page'] - 1) * $post_par_page;
     $posts_slice = array_slice($posts, $posts_offset, $post_par_page);
@@ -315,13 +338,9 @@ try {
         "data" => array_values($posts_slice)
     ];
 } catch (Exception $e) {
-    echo json_encode([
-        "status" => false,
-        "message" => "Posts fetch error: " . $e->getMessage()
-    ]);
+    echo json_encode(["status"=>false, "message"=>"Posts fetch error: ".$e->getMessage()]);
     exit();
 }
-
 
 // ----- Section: PEOPLES (users role_id = 3) -----
 try {
@@ -517,12 +536,11 @@ try {
         'industry_field' => 'industry',
         'practicearea_field' => 'practice_area',
         'speciality_field' => 'speciality',
-        'product_boost_model' => null
+        'product_boost_model' => null // controller didn't include boost for deals
     ], [
         'title','descriptions','notes','tags','photos','amount','firm','company_name','status','ownerInfo.first_name','ownerInfo.last_name','practicearea.title','specialityinfo.title','industryinfo.title'
     ], $searchValue, $hasSearch);
 
-    // 🔽 Apply search ordering
     if ($hasSearch) {
         $deals = array_filter($deals, fn($d) => ($d['accuracy_score'] ?? 0) > 0);
         usort($deals, fn($a,$b) => ($b['accuracy_score'] ?? 0) <=> ($a['accuracy_score'] ?? 0));
@@ -530,31 +548,13 @@ try {
         usort($deals, fn($a,$b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
     }
 
-    // 🔽 Fix image paths
-  // ======= ADD GLOBAL IMAGE PATH HERE =======
-foreach ($posts as &$post) {
-    if (!empty($post['photos'])) {
-        $photos = json_decode($post['photos'], true);
-
-        if (is_array($photos) && count($photos) > 0) {
-            // ✅ Convert each stored filename into a full URL
-            $photos = array_map(fn($p) => getImageUrl($p), $photos);
-        } else {
-            // If empty JSON array → return default
-            $photos = [$GLOBALS['defaultimage']];
-        }
-
-        $post['photos'] = $photos;
-    } else {
-        // If NULL in DB → return default
-        $post['photos'] = [$GLOBALS['defaultimage']];
+    // ======= FIXED PHOTO HANDLING =======
+    foreach ($deals as &$deal) {
+        $deal['photos'] = getPhotoUrls($deal['photos']);
     }
-}
-unset($post);
-// ==========================================
+    unset($deal);
+    // =====================================
 
-
-    // 🔽 Pagination
     $total_deals = count($deals);
     $deal_offset = ($pages['deals_page'] - 1) * $deal_par_page;
     $deal_slice = array_slice($deals, $deal_offset, $deal_par_page);

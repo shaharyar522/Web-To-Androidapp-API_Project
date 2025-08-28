@@ -1,0 +1,14 @@
+Developer Thinking Checklist
+
+When building any API, think in this order:
+
+Purpose: What does it do?
+Tables/Entities: Which DB tables or business logic does it touch?
+Inputs: What does the client send? (GET params, POST body, form-data, JSON)
+Processing: How will I query/filter/process data?
+
+Security: Use prepared statements, validate inputs.
+
+Output: What JSON structure will I send back?
+
+Testing: Try different scenarios in Postman.

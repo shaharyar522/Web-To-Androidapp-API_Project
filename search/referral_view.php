@@ -1,61 +1,83 @@
 <?php
 header("Content-Type: application/json");
-require_once("connection.php"); // your DB connection
+require_once("connection.php"); // DB connection
 
-// Pagination params
-$page     = isset($_GET['page']) ? (int) $_GET['page'] : 1;
-$per_page = isset($_GET['per_page']) ? (int) $_GET['per_page'] : 10;
+// Pagination params (only from POST)
+$page     = isset($_POST['page']) ? max(1, (int) $_POST['page']) : 1;
+$per_page = isset($_POST['per_page']) ? (int) $_POST['per_page'] : 10;
 $search   = isset($_POST['search']) ? strtolower(trim($_POST['search'])) : '';
 $hasSearch = !empty($search);
 
 // Calculate offset
 $offset = ($page - 1) * $per_page;
 
-// Fetch referrals base query
-$sql = "SELECT r.*, 
+// -----------------------------------
+// Base SQL
+// -----------------------------------
+$baseSql = " FROM eq_jobs r
+    LEFT JOIN citys c ON r.job_city = c.id
+    LEFT JOIN industrys i ON r.industry = i.id
+    LEFT JOIN users ow ON r.owner = ow.id
+    LEFT JOIN users ref ON r.referred_by = ref.id
+    LEFT JOIN boosts b ON r.id = b.product_id AND b.model = 'job'
+    WHERE r.deleted_at IS NULL
+      AND r.job_type = 'referral'";
+
+if ($hasSearch) {
+    $baseSql .= " AND (
+        LOWER(r.title) LIKE :search
+        OR LOWER(r.descriptions) LIKE :search
+        OR LOWER(r.notes) LIKE :search
+        OR LOWER(r.firm) LIKE :search
+        OR LOWER(r.position) LIKE :search
+        OR LOWER(r.representative) LIKE :search
+        OR LOWER(c.name) LIKE :search
+        OR LOWER(i.title) LIKE :search
+        OR LOWER(ow.first_name) LIKE :search
+        OR LOWER(ow.last_name) LIKE :search
+        OR LOWER(ref.first_name) LIKE :search
+        OR LOWER(ref.last_name) LIKE :search
+        OR LOWER(b.keywords) LIKE :search
+    )";
+}
+
+// -----------------------------------
+// Get total count
+// -----------------------------------
+$countSql = "SELECT COUNT(*) " . $baseSql;
+$countStmt = $conn->prepare($countSql);
+if ($hasSearch) {
+    $like = "%{$search}%";
+    $countStmt->bindParam(":search", $like);
+}
+$countStmt->execute();
+$total = (int)$countStmt->fetchColumn();
+
+// -----------------------------------
+// Get paginated data
+// -----------------------------------
+$dataSql = "SELECT r.*, 
                c.name AS city_name, 
                i.title AS industry_title,
                ow.first_name AS owner_first_name, ow.last_name AS owner_last_name,
                ref.first_name AS referred_first_name, ref.last_name AS referred_last_name,
                b.keywords AS boost_keywords
-        FROM eq_jobs r
-        LEFT JOIN citys c ON r.job_city = c.id
-        LEFT JOIN industrys i ON r.industry = i.id
-        LEFT JOIN users ow ON r.owner = ow.id
-        LEFT JOIN users ref ON r.referred_by = ref.id
-        LEFT JOIN boosts b ON r.id = b.product_id AND b.model = 'job'
-        WHERE r.deleted_at IS NULL
-          AND r.job_type = 'referral'";
+        " . $baseSql . "
+        ORDER BY r.created_at DESC
+        LIMIT :per_page OFFSET :offset";
 
+$dataStmt = $conn->prepare($dataSql);
 if ($hasSearch) {
-    $sql .= " AND (
-                LOWER(r.title) LIKE :search
-                OR LOWER(r.descriptions) LIKE :search
-                OR LOWER(r.notes) LIKE :search
-                OR LOWER(r.firm) LIKE :search
-                OR LOWER(r.position) LIKE :search
-                OR LOWER(r.representative) LIKE :search
-                OR LOWER(c.name) LIKE :search
-                OR LOWER(i.title) LIKE :search
-                OR LOWER(ow.first_name) LIKE :search
-                OR LOWER(ow.last_name) LIKE :search
-                OR LOWER(ref.first_name) LIKE :search
-                OR LOWER(ref.last_name) LIKE :search
-                OR LOWER(b.keywords) LIKE :search
-              )";
+    $dataStmt->bindParam(":search", $like);
 }
+$dataStmt->bindParam(":per_page", $per_page, PDO::PARAM_INT);
+$dataStmt->bindParam(":offset", $offset, PDO::PARAM_INT);
+$dataStmt->execute();
+$results = $dataStmt->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt = $conn->prepare($sql);
-
-if ($hasSearch) {
-    $like = "%{$search}%";
-    $stmt->bindParam(":search", $like);
-}
-
-$stmt->execute();
-$results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Calculate accuracy_score
+// -----------------------------------
+// Accuracy score
+// -----------------------------------
 function calculateMatchScore($item, $searchValue) {
     $fields = [
         $item['title'] ?? '',
@@ -98,28 +120,24 @@ function calculateMatchScore($item, $searchValue) {
     return 0;
 }
 
-// Add accuracy_score
-foreach ($results as &$r) {
-    $r['accuracy_score'] = $hasSearch ? calculateMatchScore($r, $search) : 0;
-}
-
-// Filter + sort
 if ($hasSearch) {
-    $results = array_filter($results, fn($r) => $r['accuracy_score'] > 0);
-    usort($results, fn($a, $b) => $b['accuracy_score'] <=> $a['accuracy_score']);
+    foreach ($results as &$r) {
+        $r['accuracy_score'] = calculateMatchScore($r, $search);
+    }
 } else {
-    usort($results, fn($a, $b) => strtotime($b['created_at']) <=> strtotime($a['created_at']));
+    foreach ($results as &$r) {
+        $r['accuracy_score'] = 0;
+    }
 }
 
-// Pagination slice
-$total = count($results);
-$results = array_slice($results, $offset, $per_page);
-
-// Response
+// -----------------------------------
+// Response with pagination info
+// -----------------------------------
 echo json_encode([
-    "status" => true,
-    "page" => $page,
-    "per_page" => $per_page,
-    "total" => $total,
-    "data" => array_values($results)
+    "status"    => true,
+    "page"      => $page,
+    "per_page"  => $per_page,
+    "total"     => $total,
+    "last_page" => ceil($total / $per_page),
+    "data"      => array_values($results)
 ]);
