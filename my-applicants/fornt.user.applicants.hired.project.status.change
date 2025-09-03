@@ -1,0 +1,147 @@
+<?php
+require_once "connection.php"; // PDO connection
+require_once "helpers.php";    // for addNotification or other helper functions
+
+use Carbon\Carbon;
+
+header("Content-Type: application/json");
+$input = json_decode(file_get_contents("php://input"), true);
+
+// Validate required params
+if (!isset($input['id']) || !isset($input['status'])) {
+    echo json_encode([
+        "success" => false,
+        "message" => "Missing required parameters: id or status"
+    ]);
+    exit;
+}
+
+try {
+    $id = $input['id'];
+    $status = strtolower($input['status']);
+
+    // Fetch application
+    $stmt = $pdo->prepare("SELECT * FROM job_applications WHERE id = ?");
+    $stmt->execute([$id]);
+    $application = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$application) {
+        echo json_encode([
+            "success" => false,
+            "message" => "Application not found"
+        ]);
+        exit;
+    }
+
+    $now = date("Y-m-d H:i:s");
+    $updates = [];
+    $message = "";
+    $notification_target_id = null;
+    $notification_message = "";
+
+    switch ($status) {
+        case "accept":
+            $updates = [
+                "accepted_date" => $now,
+                "status" => "Accepted",
+                "application_step" => 2
+            ];
+            $message = "Great, you have successfully accepted the job!";
+            $notification_target_id = $application['owner_id'];
+            $notification_message = $application['applicant_id'] . " accepted the project on " . $now;
+            break;
+
+        case "complete":
+            $updates = [
+                "completed_at" => $now,
+                "status" => "Completed",
+                "application_step" => 3
+            ];
+            $message = "You have successfully completed the job!";
+            $notification_target_id = $application['owner_id'];
+            $notification_message = $application['applicant_id'] . " completed the project on " . $now;
+            break;
+
+        case "ownerreview":
+            if (!isset($input['owner_review'])) {
+                echo json_encode([
+                    "success" => false,
+                    "message" => "Missing parameter: owner_review"
+                ]);
+                exit;
+            }
+            $updates = [
+                "owner_review" => $input['owner_review'],
+                "owner_review_at" => $now,
+                "application_step" => 5
+            ];
+            $message = "Great, you have posted a review!";
+            $notification_target_id = $application['applicant_id'];
+            $notification_message = "Owner posted a review on " . $now;
+            break;
+
+        case "employeereview":
+            if (!isset($input['employee_review'])) {
+                echo json_encode([
+                    "success" => false,
+                    "message" => "Missing parameter: employee_review"
+                ]);
+                exit;
+            }
+            $updates = [
+                "employee_review" => $input['employee_review'],
+                "employee_review_at" => $now,
+                "application_step" => 6
+            ];
+            $message = "Great, you have posted a review!";
+            $notification_target_id = $application['owner_id'];
+            $notification_message = "Employee posted a review on " . $now;
+            break;
+
+        default:
+            echo json_encode([
+                "success" => false,
+                "message" => "Invalid status value"
+            ]);
+            exit;
+    }
+
+    // Build SQL dynamically
+    $setPart = [];
+    $values = [];
+    foreach ($updates as $col => $val) {
+        $setPart[] = "$col = ?";
+        $values[] = $val;
+    }
+    $values[] = $id;
+
+    $sql = "UPDATE job_applications SET " . implode(", ", $setPart) . " WHERE id = ?";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($values);
+
+    // Send notification (assuming addNotification is defined in helpers.php)
+    if ($notification_target_id) {
+        addNotification(
+            $notification_target_id,
+            $notification_message,
+            $notification_message,
+            'job_application',
+            $application['applicant_id'],
+            'JobApplication',
+            $id
+        );
+    }
+
+    echo json_encode([
+        "success" => true,
+        "message" => $message,
+        "application_id" => $id,
+        "new_status" => $updates['status'] ?? $status,
+        "updated_fields" => $updates
+    ]);
+} catch (Exception $e) {
+    echo json_encode([
+        "success" => false,
+        "message" => $e->getMessage()
+    ]);
+}
